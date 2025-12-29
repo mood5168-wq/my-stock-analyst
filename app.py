@@ -11,8 +11,7 @@ st.set_page_config(page_title="超級分析師-FinMind實戰版", layout="wide")
 # --- 2. 安全讀取 Token 並初始化 FinMind ---
 # 這裡會從 Streamlit Cloud 的 Secrets 自動抓取，不會洩漏在程式碼中
 try:
-    FINMIND_TOKEN = st.secrets["eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJkYXRlIjoiMjAyNS0xMi0zMCAwMjoxMDoxOSIsInVzZXJfaWQiOiJtb29kNTE2OCIsImlwIjoiMjIwLjEzMi4xNzAuOTgifQ.RrqPHdFnPEFM_jHWfkvcSt4OjGEFsoTjoHcjJHot1xg"]
-    dl = DataLoader()
+    FINMIND_TOKEN = st.secrets["FINMIND_TOKEN"]
     dl.login(api_variant="token", token=FINMIND_TOKEN)
 except Exception as e:
     st.error("❌ 無法讀取 Secrets 中的 Token。請前往 Settings -> Secrets 設定 FINMIND_TOKEN。")
