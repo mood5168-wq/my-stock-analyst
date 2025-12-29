@@ -5,115 +5,134 @@ import plotly.express as px
 from datetime import datetime, timedelta
 from FinMind.data import DataLoader
 
-# --- 1. 頁面基礎設定 ---
+# --- 1. 頁面設定 ---
 st.set_page_config(page_title="超級分析師-台股戰情室", layout="wide")
 
-# --- 2. 安全讀取 Token 並登入 ---
-st.sidebar.subheader("🛠️ 系統狀態檢查")
+# --- 2. 核心診斷與 Token 處理 ---
+st.sidebar.title("🛡️ 系統狀態")
 
-try:
-    # 從 Secrets 讀取並自動清理空白
-    raw_token = st.secrets["FINMIND_TOKEN"]
-    clean_token = raw_token.strip().strip('"').strip("'")
-    
-    dl = DataLoader()
-    # 針對 FinMind 最新版本 1.x 的登入語法
-    dl.login(token=clean_token)
-    st.sidebar.success("✅ FinMind API 登入成功")
-except Exception as e:
-    st.sidebar.error("❌ 登入失敗")
-    st.error(f"無法讀取 Secrets 中的 Token。請前往 Settings → Secrets 設定 FINMIND_TOKEN。")
-    st.info("提示：格式應為 FINMIND_TOKEN = \"您的代碼\"")
+# 初始化 Token 與 登入狀態
+login_success = False
+dl = None
+
+# 自動偵測 Secrets 內容
+if "FINMIND_TOKEN" in st.secrets:
+    try:
+        # 自動清理 Token (去除可能誤加入的引號或空白)
+        raw_token = st.secrets["FINMIND_TOKEN"]
+        clean_token = str(raw_token).strip().strip('"').strip("'")
+        
+        # 初始化 FinMind
+        dl = DataLoader()
+        dl.login(token=clean_token)
+        login_success = True
+        st.sidebar.success("✅ FinMind API 登入成功")
+    except Exception as e:
+        st.sidebar.error(f"❌ 登入失敗：{e}")
+else:
+    st.error("❌ 無法讀取 Secrets 中的 Token。")
+    st.info("請檢查 Streamlit Cloud Settings -> Secrets，確保格式為：FINMIND_TOKEN = \"你的代碼\"")
+    st.sidebar.warning("⚠️ 等待 Secrets 設定...")
     st.stop()
 
-# --- 3. 核心資料抓取函式 ---
+# --- 3. 資料抓取邏輯 (含防卡死機制) ---
 
 @st.cache_data(ttl=3600)
 def get_market_data():
-    """抓取加權指數近期資料 (證交所 API)"""
-    date_str = datetime.now().strftime("%Y%m%d")
-    url = f"https://www.twse.com.tw/indicesReport/MI_5MINS_HIST?response=json&date={date_str}"
+    """抓取加權指數近期資料"""
     try:
-        res = requests.get(url)
+        date_str = datetime.now().strftime("%Y%m%d")
+        url = f"https://www.twse.com.tw/indicesReport/MI_5MINS_HIST?response=json&date={date_str}"
+        res = requests.get(url, timeout=10)
         data = res.json()
-        df = pd.DataFrame(data['data'], columns=data['fields'])
-        df['收盤指數'] = df['收盤指數'].str.replace(',', '').astype(float)
-        return df
+        if 'data' in data:
+            df = pd.DataFrame(data['data'], columns=data['fields'])
+            df['收盤指數'] = df['收盤指數'].str.replace(',', '').astype(float)
+            return df
     except:
-        return pd.DataFrame()
+        pass
+    return pd.DataFrame()
 
 @st.cache_data(ttl=3600)
-def get_finmind_chip_data():
-    """使用 FinMind 抓取昨日全台股投信鎖碼榜"""
-    # 考量假日與盤後更新，抓取最近 1-3 天的資料
-    search_date = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
-    try:
-        df_chip = dl.taiwan_stock_holding_shares_per(
-            stock_id="ALL", 
-            start_date=search_date
-        )
-        if not df_chip.empty:
-            # 依投信買超張數排序
-            top_sitc = df_chip.sort_values(by='SITC_Trust', ascending=False).head(15)
-            top_sitc = top_sitc.rename(columns={
-                'stock_id': '代號',
-                'stock_name': '名稱',
-                'SITC_Trust': '投信買超(張)'
-            })
-            return top_sitc[['代號', '名稱', '投信買超(張)']]
+def get_chip_data():
+    """抓取全台股投信鎖碼榜 (自動搜尋最近交易日)"""
+    if not login_success:
         return pd.DataFrame()
-    except:
-        return pd.DataFrame()
+    
+    # 嘗試往回找 5 天，確保週末也能看到最後一個交易日的資料
+    for i in range(1, 6):
+        target_date = (datetime.now() - timedelta(days=i)).strftime("%Y-%m-%d")
+        try:
+            df = dl.taiwan_stock_holding_shares_per(stock_id="ALL", start_date=target_date)
+            if not df.empty:
+                # 篩選投信買超前 15 名
+                top_sitc = df.sort_values(by='SITC_Trust', ascending=False).head(15)
+                top_sitc = top_sitc.rename(columns={
+                    'stock_id': '代號',
+                    'stock_name': '名稱',
+                    'SITC_Trust': '投信買超(張)'
+                })
+                return top_sitc[['代號', '名稱', '投信買超(張)']], target_date
+        except:
+            continue
+    return pd.DataFrame(), None
 
-# --- 4. 網頁介面佈局 ---
-st.title("🏹 超級分析師：台股戰情室 (FinMind 實戰版)")
-st.markdown(f"📅 系統時間：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+# --- 4. 網頁介面開發 ---
 
-# --- 側邊欄：風控診斷器 ---
-st.sidebar.markdown("---")
-st.sidebar.header("🛡️ 個人持股風控")
-my_stock = st.sidebar.text_input("監控代號", "2330")
-buy_p = st.sidebar.number_input("買入成本", value=1000.0)
-high_p = st.sidebar.number_input("買入後最高價", value=1050.0)
-curr_p = st.sidebar.number_input("目前市價", value=1030.0)
+st.title("🏹 超級分析師：台股戰情室")
+st.caption(f"系統檢查時間：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
-# 風控計算
-sl = round(buy_p * 0.93, 2)
-ts = round(high_p * 0.90, 2)
+# 分欄佈局
+tab1, tab2 = st.tabs(["📈 市場掃描", "🛡️ 持股診斷"])
 
-if curr_p <= sl:
-    st.sidebar.error(f"🚨 停損出場：{sl}")
-elif curr_p <= ts:
-    st.sidebar.warning(f"⚠️ 移動停利：{ts}")
-else:
-    st.sidebar.success("✅ 目前安全")
+with tab1:
+    # A. 大盤走勢
+    st.subheader("📊 大盤趨勢 (證交所即時數據)")
+    m_df = get_market_data()
+    if not m_df.empty:
+        fig_m = px.line(m_df, x='日期', y='收盤指數', title="加權指數近日走勢")
+        st.plotly_chart(fig_m, use_container_width=True)
+    else:
+        st.warning("目前無法獲取大盤數據，請確認網路連線。")
 
-# --- 主畫面顯示 ---
+    # B. 籌碼鎖碼榜
+    st.markdown("---")
+    chip_df, data_date = get_chip_data()
+    st.subheader(f"🔥 投信鎖碼榜 (資料日期：{data_date if data_date else '搜尋中'})")
+    if not chip_df.empty:
+        st.dataframe(chip_df, use_container_width=True, hide_index=True)
+        st.success(f"已成功載入全台股籌碼數據。")
+    else:
+        st.info("💡 正在搜尋最近的籌碼資料，請稍候...")
 
-# A. 大盤走勢
-st.subheader("📊 大盤趨勢 (證交所數據)")
-m_df = get_market_data()
-if not m_df.empty:
-    fig_m = px.line(m_df, x='日期', y='收盤指數', title="加權指數近日走勢")
-    st.plotly_chart(fig_m, use_container_width=True)
+with tab2:
+    st.subheader("🛡️ 個人持股風控分析")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        my_buy = st.number_input("買入成本價", value=600.0)
+    with c2:
+        my_high = st.number_input("買入後最高價", value=650.0)
+    with c3:
+        my_curr = st.number_input("目前股價", value=630.0)
+    
+    # 計算風控價位
+    sl = round(my_buy * 0.93, 2)
+    ts = round(my_high * 0.90, 2)
+    
+    # 視覺化
+    risk_df = pd.DataFrame({
+        '項目': ['成本', '現價', '停損線(-7%)', '移動停利(-10%)'],
+        '價格': [my_buy, my_curr, sl, ts]
+    })
+    fig_risk = px.bar(risk_df, x='項目', y='價格', color='項目', text='價格')
+    st.plotly_chart(fig_risk, use_container_width=True)
+    
+    if my_curr <= sl:
+        st.error(f"🚨 觸發停損！建議出場位：{sl}")
+    elif my_curr <= ts:
+        st.warning(f"⚠️ 觸發移動停利！建議出場位：{ts}")
+    else:
+        st.success("✅ 目前安全，請遵守紀律續抱。")
 
-# B. 籌碼掃描
 st.markdown("---")
-st.subheader("🔥 投信鎖碼榜 (昨日法人買超前 15 名)")
-chip_df = get_finmind_chip_data()
-if not chip_df.empty:
-    st.dataframe(chip_df, use_container_width=True, hide_index=True)
-else:
-    st.info("💡 尚未獲取最新籌碼數據，可能非交易日或資料處理中。")
-
-# C. 風控視覺化
-st.markdown("---")
-st.subheader(f"📈 {my_stock} 風控位階圖")
-risk_data = pd.DataFrame({
-    '項目': ['成本', '現價', '停損線', '停利線'],
-    '價格': [buy_p, curr_p, sl, ts]
-})
-fig_risk = px.bar(risk_data, x='項目', y='價格', color='項目', text='價格')
-st.plotly_chart(fig_risk, use_container_width=True)
-
-st.caption("免責聲明：本程式數據僅供參考，投資請務必遵守個人紀律。")
+st.caption("數據來源：台灣證券交易所、FinMind API。本程式僅供參考。")
