@@ -5,71 +5,65 @@ from datetime import datetime, timedelta
 from FinMind.data import DataLoader
 
 # --- 1. 頁面設定 ---
-st.set_page_config(page_title="超級分析師-個股全能版", layout="wide")
+st.set_page_config(page_title="超級分析師-籌碼力道版", layout="wide")
 
-# --- 2. 安全登入 (相容模式) ---
+# --- 2. 安全登入 ---
 dl = DataLoader()
 login_ok = False
-try:
-    if "FINMIND_USER_ID" in st.secrets:
+if "FINMIND_USER_ID" in st.secrets:
+    try:
         dl.login(user_id=st.secrets["FINMIND_USER_ID"], password=st.secrets["FINMIND_PASSWORD"])
         login_ok = True
-    elif "FINMIND_TOKEN" in st.secrets:
-        dl.login(token=st.secrets["FINMIND_TOKEN"].strip().strip('"'))
-        login_ok = True
-except: st.error("API 登入失敗")
+    except: pass
 
-# --- 3. 核心功能：個股深度診斷 ---
+# --- 3. 核心功能：抓取淨買賣超 ---
 
 @st.cache_data(ttl=600)
-def get_stock_details(sid):
-    """一次抓取營收與法人買賣超"""
-    start_date = (datetime.now() - timedelta(days=180)).strftime("%Y-%m-%d")
+def get_stock_chip_trend(sid):
+    """抓取法人買賣超，並計算淨額"""
+    start_date = (datetime.now() - timedelta(days=90)).strftime("%Y-%m-%d")
     try:
-        # 抓營收
-        rev = dl.taiwan_stock_month_revenue(stock_id=sid, start_date=start_date)
-        # 抓三大法人買賣超 (這比掃描全台股快非常多)
-        chip = dl.taiwan_stock_institutional_investors(stock_id=sid, start_date=start_date)
-        return rev, chip
-    except: return pd.DataFrame(), pd.DataFrame()
+        df = dl.taiwan_stock_institutional_investors(stock_id=sid, start_date=start_date)
+        if not df.empty:
+            # 計算淨買賣超：買進張數 - 賣出張數
+            df['net_buy'] = df['buy'] - df['sell']
+            return df
+    except: pass
+    return pd.DataFrame()
 
-# --- 4. UI 介面 ---
-st.title("🏹 超級分析師：個股深度戰情室")
+# --- 4. 介面呈現 ---
+st.title("🏹 超級分析師：法人力道診斷")
 
-# 側邊欄：快速選單
-st.sidebar.header("🎯 診斷目標")
 target_sid = st.sidebar.text_input("輸入股票代號", "2330")
 
 if login_ok:
-    with st.spinner('正在分析該股籌碼與基本面...'):
-        rev_df, chip_df = get_stock_details(target_sid)
+    with st.spinner('正在分析買賣力道...'):
+        chip_df = get_stock_chip_trend(target_sid)
         
-        # A. 籌碼面：法人買賣超 (最有意思的地方！)
-        st.subheader(f"🔥 {target_sid} 法人買賣超監控 (近半年)")
         if not chip_df.empty:
-            # 整理資料，只看外資與投信
-            chip_plot = chip_df[chip_df['name'].isin(['Foreign_Investor', 'Investment_Trust'])]
-            fig_chip = px.bar(chip_plot, x='date', y='buy', color='name', 
-                              title="外資與投信買賣力道", barmode='group')
-            st.plotly_chart(fig_chip, use_container_width=True)
+            st.subheader(f"🔥 {target_sid} 法人淨買賣超 (紅進綠出)")
             
-            # 計算最近三天的合計
-            latest_chip = chip_df.tail(6) # 兩類法人 x 3天
-            st.info(f"💡 筆記：觀察最近法人是否有「連買」現象，通常是起漲訊號！")
+            # 過濾外資與投信
+            plot_df = chip_df[chip_df['name'].isin(['Foreign_Investor', 'Investment_Trust'])]
+            
+            # 建立圖表：y 軸改用 net_buy
+            fig = px.bar(plot_df, x='date', y='net_buy', color='name',
+                         title="向上代表法人買超，向下代表法人賣超",
+                         barmode='group',
+                         color_discrete_map={'Foreign_Investor': '#EF553B', 'Investment_Trust': '#00CC96'})
+            
+            # 加入一條零軸橫線，方便看正負
+            fig.add_hline(y=0, line_dash="dash", line_color="white")
+            
+            st.plotly_chart(fig, use_container_width=True)
+            
+            # 顯示最近五天的詳細數據表格
+            st.markdown("### 📋 最近 5 日數據清單")
+            recent_df = plot_df.tail(10).sort_values(by='date', ascending=False)
+            recent_df = recent_df[['date', 'name', 'buy', 'sell', 'net_buy']]
+            recent_df.columns = ['日期', '法人名稱', '買進', '賣出', '淨買賣超']
+            st.table(recent_df)
         else:
-            st.warning("暫時無法取得該股籌碼資料")
-
-        # B. 基本面：營收趨勢
-        st.markdown("---")
-        st.subheader(f"📊 {target_sid} 營收成長追蹤")
-        if not rev_df.empty:
-            fig_rev = px.line(rev_df, x='revenue_month', y='revenue', markers=True, title="月營收走勢")
-            st.plotly_chart(fig_rev, use_container_width=True)
-        
+            st.warning("查無此標的籌碼資料，請檢查代號是否正確。")
 else:
-    st.warning("請先設定 API 登入資訊")
-
-# 風控提示維持
-st.sidebar.markdown("---")
-cost = st.sidebar.number_input("持股成本", value=100.0)
-st.sidebar.metric("停損線 (-7%)", f"{round(cost*0.93, 2)}")
+    st.error("API 尚未連線成功")
