@@ -2,113 +2,94 @@ import streamlit as st
 import pandas as pd
 import requests
 import plotly.express as px
-import plotly.graph_objects as go
 from datetime import datetime, timedelta
 from FinMind.data import DataLoader
 
 # --- 1. 頁面設定 ---
-st.set_page_config(page_title="超級分析師-進階戰情室", layout="wide")
+st.set_page_config(page_title="超級分析師-穩健版", layout="wide")
 
 # --- 2. 安全登入 ---
-st.sidebar.title("🛡️ 系統設定與診斷")
+st.sidebar.title("🛡️ 系統狀態")
 login_success = False
 dl = DataLoader()
 
-try:
-    if "FINMIND_USER_ID" in st.secrets and "FINMIND_PASSWORD" in st.secrets:
+if "FINMIND_USER_ID" in st.secrets:
+    try:
         dl.login(user_id=st.secrets["FINMIND_USER_ID"], password=st.secrets["FINMIND_PASSWORD"])
         login_success = True
-    elif "FINMIND_TOKEN" in st.secrets:
-        dl.login(token=st.secrets["FINMIND_TOKEN"].strip().strip('"'))
-        login_success = True
-except:
-    st.sidebar.error("❌ 登入失敗，請檢查 Secrets")
+        st.sidebar.success("✅ 帳密登入成功")
+    except:
+        if "FINMIND_TOKEN" in st.secrets:
+            try:
+                dl.login(token=st.secrets["FINMIND_TOKEN"].strip().strip('"'))
+                login_success = True
+                st.sidebar.success("✅ Token 登入成功")
+            except: st.sidebar.error("❌ 登入失敗")
 
-# --- 3. 功能開發：資料抓取 ---
+# --- 3. 核心功能：個股營收與籌碼 ---
 
 @st.cache_data(ttl=3600)
 def get_revenue_data(stock_id):
-    """抓取特定個股營收趨勢"""
+    if not login_success: return pd.DataFrame()
     start_date = (datetime.now() - timedelta(days=730)).strftime("%Y-%m-%d")
     try:
-        df = dl.taiwan_stock_month_revenue(stock_id=stock_id, start_date=start_date)
-        return df
+        return dl.taiwan_stock_month_revenue(stock_id=stock_id, start_date=start_date)
     except: return pd.DataFrame()
 
 @st.cache_data(ttl=3600)
-def get_advanced_chip_data(min_buy, filter_ma):
-    """進階選股：投信買超張數 + 月線過濾"""
+def get_guaranteed_chip_data(min_buy):
+    """保證有資料的抓取邏輯"""
     if not login_success: return pd.DataFrame(), None
     
-    for i in range(1, 6):
+    # 往回找最近的交易日
+    for i in range(1, 7):
         target_date = (datetime.now() - timedelta(days=i)).strftime("%Y-%m-%d")
         try:
-            # 1. 抓取投信資料
+            # 關鍵修改：先抓取當天所有籌碼資料，不做 stock_id 篩選以加快速度
             df = dl.taiwan_stock_holding_shares_per(stock_id="ALL", start_date=target_date, end_date=target_date)
-            if df.empty: continue
             
-            # 2. 基礎篩選：買超張數
-            df = df[df['SITC_Trust'] >= min_buy]
-            
-            if filter_ma and not df.empty:
-                # 這裡為了效能，我們只針對買超前 30 名進行股價過濾
-                top_30 = df.sort_values(by='SITC_Trust', ascending=False).head(30)
-                passed_list = []
-                for _, row in top_30.iterrows():
-                    # 抓取近一個月收盤價計算 MA20
-                    price_df = dl.taiwan_stock_daily(
-                        stock_id=row['stock_id'], 
-                        start_date=(datetime.now() - timedelta(days=40)).strftime("%Y-%m-%d")
-                    )
-                    if len(price_df) >= 20:
-                        ma20 = price_df['close'].tail(20).mean()
-                        curr_price = price_df['close'].iloc[-1]
-                        if curr_price > ma20: # 股價在月線之上
-                            passed_list.append(row)
-                df = pd.DataFrame(passed_list)
-            
-            if not df.empty:
-                df = df.sort_values(by='SITC_Trust', ascending=False)
-                return df[['stock_id', 'stock_name', 'SITC_Trust']], target_date
-        except: continue
+            if not df.empty and 'SITC_Trust' in df.columns:
+                # 排除買超為 0 的股票
+                df = df[df['SITC_Trust'] > 0]
+                
+                # 套用使用者設定的濾網
+                filtered = df[df['SITC_Trust'] >= min_buy]
+                
+                # 如果濾完是空的，就直接給前 15 名 (保底)
+                if filtered.empty:
+                    st.sidebar.warning(f"{target_date} 無達標股票，已顯示當日買超榜")
+                    return df.sort_values(by='SITC_Trust', ascending=False).head(15), target_date
+                
+                return filtered.sort_values(by='SITC_Trust', ascending=False), target_date
+        except:
+            continue
     return pd.DataFrame(), None
 
 # --- 4. 介面呈現 ---
+st.title("🏹 超級分析師：台股戰情室")
 
-# A. 側邊欄濾網設定
-st.sidebar.markdown("---")
-st.sidebar.subheader("🎯 選股濾網設定")
-min_buy_vol = st.sidebar.number_input("投信最少買超(張)", value=500, step=100)
-ma_filter = st.sidebar.checkbox("僅顯示「站上月線(20MA)」個股", value=True)
+# 第一區塊：個股診斷
+with st.expander("🔍 特定股票營收診斷", expanded=True):
+    tid = st.text_input("輸入股票代號", "2330")
+    r_df = get_revenue_data(tid)
+    if not r_df.empty:
+        st.plotly_chart(px.bar(r_df, x='revenue_month', y='revenue', title=f"{tid} 營收走勢"), use_container_width=True)
 
-# B. 主頁面：個股診斷區
-st.title("🏹 超級分析師：進階戰情室")
-with st.expander("🔍 特定股票：營收趨勢診斷", expanded=False):
-    target_stock = st.text_input("輸入股票代號 (例: 2330)", "2330")
-    rev_df = get_revenue_data(target_stock)
-    if not rev_df.empty:
-        fig_rev = px.bar(rev_df, x='revenue_month', y='revenue', 
-                         title=f"{target_stock} 近兩年營收走勢",
-                         labels={'revenue':'月營收(元)', 'revenue_month':'月份'})
-        st.plotly_chart(fig_rev, use_container_width=True)
-    else:
-        st.info("請輸入代號以查詢營收...")
-
-# C. 主頁面：自訂選股區
+# 第二區塊：籌碼選股
 st.markdown("---")
-st.subheader(f"🔥 專業篩選：投信買超 > {min_buy_vol} 張 " + ("(已過濾月線以下)" if ma_filter else ""))
+buy_threshold = st.sidebar.slider("投信買超門檻 (張)", 0, 1000, 100)
 
-with st.spinner('🚀 正在依您的濾網條件掃描全台股...'):
-    chip_df, d_date = get_advanced_chip_data(min_buy_vol, ma_filter)
-    if not chip_df.empty:
-        chip_df.columns = ['代號', '名稱', '投信買超(張)']
-        st.dataframe(chip_df, use_container_width=True, hide_index=True)
-        st.success(f"✅ 找到 {len(chip_df)} 檔符合條件的標的 (資料日期：{d_date})")
+with st.spinner('正在分析大數據...'):
+    c_df, d_date = get_guaranteed_chip_data(buy_threshold)
+    if not c_df.empty:
+        st.subheader(f"🔥 投信鎖碼名單 ({d_date})")
+        display_df = c_df[['stock_id', 'stock_name', 'SITC_Trust']].copy()
+        display_df.columns = ['代號', '名稱', '買超(張)']
+        st.dataframe(display_df, use_container_width=True, hide_index=True)
     else:
-        st.warning("⚠️ 目前條件下無符合股票，建議調降買超張數門檻。")
+        st.error("暫時抓不到籌碼資料，請稍後再試。")
 
-# D. 側邊欄風控維持
+# 側邊欄風控
 st.sidebar.markdown("---")
-st.sidebar.subheader("🛡️ 個人持股風控")
-my_buy = st.sidebar.number_input("成本價", value=600.0)
-st.sidebar.write(f"🛑 建議停損線: {round(my_buy * 0.93, 2)}")
+cost = st.sidebar.number_input("持股成本", value=100.0)
+st.sidebar.write(f"🛑 停損點 (-7%): {round(cost*0.93, 2)}")
