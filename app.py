@@ -1149,6 +1149,8 @@ def compose_oldwang_decision(
     leader: dict,
     chip_summary: dict,
     contrarian_flag: bool,
+    market_regime: Optional[dict] = None,
+    rs_info: Optional[dict] = None,
 ) -> dict:
     """
     產出「持股判斷依據」與建議動作（老王策略 + 籌碼分析）。
@@ -1164,6 +1166,27 @@ def compose_oldwang_decision(
     # 籌碼摘要（寫入持股判斷依據）
     chip = chip_summary or {}
     chip_sig = chip.get("signal", "中性")
+
+    # 市場狀態（Regime）
+    mr = market_regime or {}
+    if isinstance(mr, dict) and mr.get("label"):
+        br = mr.get("breadth_up_ratio")
+        if br is not None and not pd.isna(br):
+            reasons.append(f"市場狀態：{mr.get('label')}（上漲比例 {float(br):.1f}%）")
+        else:
+            reasons.append(f"市場狀態：{mr.get('label')}")
+        if mr.get("comment"):
+            reasons.append(f"盤勢解讀：{mr.get('comment')}")
+
+    # 相對強度（RS）
+    rs = rs_info or {}
+    if isinstance(rs, dict) and rs.get("signal") and rs.get("signal") != "N/A":
+        op = rs.get("outperf_window_pct")
+        w = rs.get("window", 20)
+        if op is not None and not pd.isna(op):
+            reasons.append(f"相對強度：{rs.get('signal')}（{w}日超越大盤 {float(op):+.2f}%）")
+        else:
+            reasons.append(f"相對強度：{rs.get('signal')}")
 
     net5 = chip.get("net_5d_total")
     f5 = chip.get("net_5d_foreign")
@@ -1217,6 +1240,15 @@ def compose_oldwang_decision(
 
     # -------- 非持股模式：是否進場 --------
     else:
+        # Regime filter: 在盤勢偏空時，不做突破追價，優先觀望/拉回承接
+        if (market_regime or {}).get("regime") == "risk_off":
+            action = "等待"
+            reasons.append("Regime 過濾：盤勢偏空，避免突破追價；只考慮拉回承接或觀望。")
+        
+        # RS filter: 若相對強度明顯偏弱，避免追價進場（除非只是策略性拉回試單）
+        if (rs_info or {}).get("signal") == "相對弱" and action in ["等待", "等待拉回", "可分批進場"]:
+            reasons.append("RS 過濾：相對弱勢（落後大盤），避免追高；除非拉回到關鍵支撐再評估。")
+
         if bias_level == "danger":
             action = "等待"
             reasons.append("乖離過大：禁止追高，等回測/整理後再評估")
@@ -1244,9 +1276,31 @@ def compose_oldwang_decision(
     if oldwang.get("washout_ignore"):
         reasons.append("無視單一K棒：長黑但守住10MA，偏洗盤，勿因單日翻空")
 
+
+    # -------- 最終決策校正（Regime / RS）--------
+    mr = market_regime or {}
+    rs = rs_info or {}
+
+    # 盤勢偏空：非持股不進場；持股只續抱不加碼
+    if mr.get("regime") == "risk_off":
+        if not is_holding:
+            if action != "等待":
+                action = "等待"
+                reasons.append("最終決策：盤勢偏空，所有進場訊號一律降級為等待。")
+        else:
+            if action == "續抱/可擇機加碼":
+                action = "續抱但不加碼"
+                reasons.append("最終決策：盤勢偏空，續抱但不加碼，改以守線/控風險為主。")
+
+    # 盤勢震盪：若 RS 明顯偏弱，進場訊號降級
+    if mr.get("regime") == "neutral" and (rs.get("signal") == "相對弱"):
+        if not is_holding and action == "可分批進場":
+            action = "等待拉回"
+            reasons.append("最終決策：盤勢震盪且 RS 偏弱，進場訊號降級為等待拉回。")
+
     return {"action": action, "reasons": reasons}
 
-def build_trade_plan(struct: dict, pattern_info: dict, vol_quality: dict, bias_alert: dict, score: dict) -> dict:
+def build_trade_plan(struct: dict, pattern_info: dict, vol_quality: dict, bias_alert: dict, score: dict, market_regime: Optional[dict] = None, rs_info: Optional[dict] = None) -> dict:
     close = struct.get("close", np.nan)
     ma20 = struct.get("ma20", np.nan)
     ma60 = struct.get("ma60", np.nan)
@@ -1277,6 +1331,24 @@ def build_trade_plan(struct: dict, pattern_info: dict, vol_quality: dict, bias_a
     lines.append(f"量價品質：**{vol_quality.get('label','-')}** — {vol_quality.get('detail','')}")
     lines.append("")
 
+    # Market regime + RS (context)
+    mr = market_regime or {}
+    if isinstance(mr, dict) and mr.get("label"):
+        br = mr.get("breadth_up_ratio")
+        if br is not None and not pd.isna(br):
+            lines.append(f"市場狀態：**{mr.get('label')}**（上漲比例 {float(br):.1f}%）")
+        else:
+            lines.append(f"市場狀態：**{mr.get('label')}**")
+    rs = rs_info or {}
+    if isinstance(rs, dict) and rs.get("signal") and rs.get("signal") != "N/A":
+        op = rs.get("outperf_window_pct")
+        w = rs.get("window", 20)
+        if op is not None and not pd.isna(op):
+            lines.append(f"相對強度：**{rs.get('signal')}**（{w}日超越大盤 {float(op):+.2f}%）")
+        else:
+            lines.append(f"相對強度：**{rs.get('signal')}**")
+    lines.append("")
+
     # If bias danger => forbid chase
     if (bias_alert or {}).get("level") == "danger":
         lines.append("結論：**❌ 乖離過大，禁止追高。**")
@@ -1286,6 +1358,19 @@ def build_trade_plan(struct: dict, pattern_info: dict, vol_quality: dict, bias_a
             lines.append(f"若已持有：可用 20MA 下方緩衝作為風險點（約 {stop:.2f}）。")
         return {"summary": "\n".join(lines), "supports": supports, "resistances": resistances, "stop": stop, "t1": t1, "t2": t2, "stance": "禁止追高"}
 
+
+    # Regime gating: 盤勢偏空不做突破追價；震盪盤則要求 RS 相對強才考慮突破
+    if (market_regime or {}).get("regime") == "risk_off" and pattern == "突破盤":
+        lines.append("Regime 過濾：**盤勢偏空**，不建議採用突破追價策略，改以等待/拉回承接。")
+        pattern = "盤整盤"
+        entry_type = "等待"
+        lines.append("")
+    elif (market_regime or {}).get("regime") == "neutral" and pattern == "突破盤":
+        if (rs_info or {}).get("signal") != "相對強":
+            lines.append("Regime 過濾：**盤勢震盪**且 RS 未顯示相對強勢，突破需更嚴格，建議先等回測。")
+            pattern = "盤整盤"
+            entry_type = "等待拉回"
+            lines.append("")
     if pattern == "突破盤" and pd.notna(prev20_high):
         lines.append("交易計畫（突破型）：")
         if vol_confirm is not None:
@@ -1700,6 +1785,176 @@ def get_ai_advice(stock_id: str, stock_info: pd.DataFrame, price_df: pd.DataFram
 
 
 
+
+# -----------------------------
+# Market regime + Relative strength (RS)
+# -----------------------------
+def compute_market_regime(market_proxy_df: pd.DataFrame, vol_rank_today: pd.DataFrame, proxy_id: str) -> dict:
+    """Compute market regime using a proxy (e.g., 0050) + market breadth.
+
+    Returns:
+      {
+        proxy_id, close, ma20, ma60, above_ma20, above_ma60, ma20_slope,
+        breadth_up_ratio, regime, label, comment
+      }
+    """
+    out = {
+        "proxy_id": str(proxy_id),
+        "close": np.nan,
+        "ma20": np.nan,
+        "ma60": np.nan,
+        "above_ma20": None,
+        "above_ma60": None,
+        "ma20_slope": np.nan,
+        "breadth_up_ratio": np.nan,
+        "regime": "unknown",
+        "label": "未知",
+        "comment": "缺少大盤代理或市場資料",
+    }
+
+    if market_proxy_df is None or market_proxy_df.empty or "close" not in market_proxy_df.columns:
+        return out
+
+    mdf = market_proxy_df.copy()
+    mdf = normalize_date_col(mdf, "date")
+    mdf["close"] = pd.to_numeric(mdf["close"], errors="coerce")
+    mdf = mdf.dropna(subset=["close"]).copy()
+    if mdf.empty:
+        return out
+    try:
+        mdf = mdf.sort_values("date")
+    except Exception:
+        pass
+
+    mdf["MA20"] = mdf["close"].rolling(20).mean()
+    mdf["MA60"] = mdf["close"].rolling(60).mean()
+
+    close = float(mdf["close"].iloc[-1])
+    ma20 = float(mdf["MA20"].iloc[-1]) if pd.notna(mdf["MA20"].iloc[-1]) else np.nan
+    ma60 = float(mdf["MA60"].iloc[-1]) if pd.notna(mdf["MA60"].iloc[-1]) else np.nan
+    out["close"] = close
+    out["ma20"] = ma20
+    out["ma60"] = ma60
+
+    if pd.notna(ma20):
+        out["above_ma20"] = bool(close >= ma20)
+    if pd.notna(ma60):
+        out["above_ma60"] = bool(close >= ma60)
+
+    if len(mdf) >= 6 and pd.notna(mdf["MA20"].iloc[-1]) and pd.notna(mdf["MA20"].iloc[-6]):
+        out["ma20_slope"] = float(mdf["MA20"].iloc[-1] - mdf["MA20"].iloc[-6])
+
+    # Breadth from vol_rank_today
+    if isinstance(vol_rank_today, pd.DataFrame) and not vol_rank_today.empty:
+        vr = vol_rank_today.copy()
+        vr = ensure_change_rate(vr)
+        try:
+            out["breadth_up_ratio"] = float((vr["change_rate"] > 0).mean() * 100)
+        except Exception:
+            pass
+
+    breadth = out["breadth_up_ratio"]
+    trend_ok = (out["above_ma20"] is True) and (pd.isna(ma60) or (ma20 >= ma60))
+    slope_ok = (pd.isna(out["ma20_slope"]) or (out["ma20_slope"] >= 0))
+
+    # Regime classification (simple but robust)
+    if (out["above_ma20"] is True) and (out["above_ma60"] is True) and slope_ok and (pd.isna(breadth) or breadth >= 50):
+        out["regime"] = "risk_on"
+        out["label"] = "偏多"
+        out["comment"] = "盤勢偏多：突破/追強可行，但仍需遵守乖離與量能。"
+    elif (out["above_ma20"] is False) and (out["above_ma60"] is False) and (pd.isna(breadth) or breadth <= 45):
+        out["regime"] = "risk_off"
+        out["label"] = "偏空"
+        out["comment"] = "盤勢偏空：降低出手頻率，避免突破追價，偏向拉回承接或觀望。"
+    else:
+        out["regime"] = "neutral"
+        out["label"] = "震盪/中性"
+        out["comment"] = "盤勢震盪：突破需更嚴格（量能+相對強），優先等拉回承接。"
+
+    # If MA60 missing (insufficient history), degrade confidence
+    if pd.isna(ma60):
+        out["comment"] += "（大盤 MA60 資料不足，僅供參考）"
+
+    return out
+
+
+def compute_relative_strength(stock_df: pd.DataFrame, market_proxy_df: pd.DataFrame, window: int = 20) -> dict:
+    """Relative Strength vs market proxy.
+
+    - RS ratio: stock_close / proxy_close
+    - outperf_window: (stock_ret_window - proxy_ret_window) in %
+    - signal: 相對強/中性/相對弱
+    """
+    out = {
+        "window": int(window),
+        "rs_ratio": np.nan,
+        "rs_ma20": np.nan,
+        "rs_slope5": np.nan,
+        "outperf_window_pct": np.nan,
+        "signal": "N/A",
+        "note": "",
+    }
+    if stock_df is None or stock_df.empty or market_proxy_df is None or market_proxy_df.empty:
+        out["note"] = "缺少個股或大盤資料"
+        return out
+    if ("date" not in stock_df.columns) or ("close" not in stock_df.columns) or ("date" not in market_proxy_df.columns) or ("close" not in market_proxy_df.columns):
+        out["note"] = "資料欄位不足"
+        return out
+
+    s = stock_df[["date", "close"]].copy()
+    m = market_proxy_df[["date", "close"]].copy()
+    s = normalize_date_col(s, "date")
+    m = normalize_date_col(m, "date")
+    s["close"] = pd.to_numeric(s["close"], errors="coerce")
+    m["close"] = pd.to_numeric(m["close"], errors="coerce")
+    s = s.dropna(subset=["close"]).copy()
+    m = m.dropna(subset=["close"]).copy()
+    if s.empty or m.empty:
+        out["note"] = "缺少有效收盤價"
+        return out
+
+    try:
+        s = s.sort_values("date")
+        m = m.sort_values("date")
+    except Exception:
+        pass
+
+    mm = pd.merge(s, m, on="date", how="inner", suffixes=("_s", "_m"))
+    if mm.empty:
+        out["note"] = "個股與大盤日期無法對齊"
+        return out
+
+    mm["rs"] = safe_div(mm["close_s"], mm["close_m"], default=np.nan)
+    mm["rs_ma20"] = mm["rs"].rolling(20).mean()
+
+    out["rs_ratio"] = float(mm["rs"].iloc[-1]) if pd.notna(mm["rs"].iloc[-1]) else np.nan
+    out["rs_ma20"] = float(mm["rs_ma20"].iloc[-1]) if pd.notna(mm["rs_ma20"].iloc[-1]) else np.nan
+
+    if len(mm) >= 6 and pd.notna(mm["rs"].iloc[-1]) and pd.notna(mm["rs"].iloc[-6]):
+        out["rs_slope5"] = float(mm["rs"].iloc[-1] - mm["rs"].iloc[-6])
+
+    w = int(window)
+    if len(mm) >= (w + 1) and pd.notna(mm["close_s"].iloc[-1]) and pd.notna(mm["close_s"].iloc[-(w + 1)]) and pd.notna(mm["close_m"].iloc[-1]) and pd.notna(mm["close_m"].iloc[-(w + 1)]):
+        stock_ret = float(mm["close_s"].iloc[-1] / mm["close_s"].iloc[-(w + 1)] - 1.0)
+        mkt_ret = float(mm["close_m"].iloc[-1] / mm["close_m"].iloc[-(w + 1)] - 1.0)
+        out["outperf_window_pct"] = (stock_ret - mkt_ret) * 100.0
+
+    # signal
+    rs = out["rs_ratio"]
+    rs_ma = out["rs_ma20"]
+    slope = out["rs_slope5"]
+    outperf = out["outperf_window_pct"]
+
+    if pd.notna(outperf) and outperf >= 0.0 and pd.notna(slope) and slope > 0 and pd.notna(rs) and pd.notna(rs_ma) and rs >= rs_ma:
+        out["signal"] = "相對強"
+    elif pd.notna(outperf) and outperf < 0.0 and pd.notna(slope) and slope < 0 and pd.notna(rs) and pd.notna(rs_ma) and rs < rs_ma:
+        out["signal"] = "相對弱"
+    else:
+        out["signal"] = "中性"
+
+    return out
+
+
 # -----------------------------
 # 10) 老王選股器（基於 5/10/20/60 + 三陽開泰/四海遊龍 + 量價/領導股/守10MA）
 # -----------------------------
@@ -1820,6 +2075,34 @@ def get_candidate_history_dailyall_cached(token: str, stock_ids: list[str], end_
 
     hist = pd.concat(frames, ignore_index=True)
     hist = normalize_date_col(hist, "date")
+
+    # Include market proxy in history (for RS)
+    proxy_id = str(market_proxy_id).strip() or "0050"
+    # If proxy not present in hist (e.g., proxy not in candidate_ids), fetch separately and append
+    if proxy_id not in set(hist["stock_id"].astype(str).unique()):
+        try:
+            proxy_hist = get_daily_one_cached(token, proxy_id, start_date=(datetime.now(tz=TZ) - timedelta(days=260) if TZ else datetime.now() - timedelta(days=260)).strftime("%Y-%m-%d"), end_date=None)
+            if proxy_hist is not None and not proxy_hist.empty:
+                proxy_hist = proxy_hist.copy()
+                proxy_hist["stock_id"] = str(proxy_id)
+                proxy_hist = normalize_date_col(proxy_hist, "date")
+                for c in ["close", "Trading_Volume", "Trading_money"]:
+                    if c in proxy_hist.columns:
+                        proxy_hist[c] = pd.to_numeric(proxy_hist[c], errors="coerce")
+                hist = pd.concat([hist, proxy_hist], ignore_index=True)
+        except Exception:
+            pass
+
+    mkt = hist[hist["stock_id"].astype(str) == str(proxy_id)].copy()
+    if not mkt.empty:
+        try:
+            mkt = mkt.sort_values("date")
+        except Exception:
+            pass
+        mkt_close = mkt[["date", "close"]].dropna().copy()
+    else:
+        mkt_close = pd.DataFrame(columns=["date", "close"])
+
     hist["stock_id"] = hist["stock_id"].astype(str)
 
     for c in ["close", "open", "max", "min", "Trading_Volume", "Trading_money", "spread"]:
@@ -1832,6 +2115,9 @@ def oldwang_screener(
     token: str,
     stock_info: pd.DataFrame,
     vol_rank_today: pd.DataFrame,
+    market_proxy_id: str = "0050",
+    rs_window: int = 20,
+    require_rs: bool = True,
     universe_top_n: int = 300,
     output_top_k: int = 80,
     require_leader: bool = True,
@@ -1968,6 +2254,45 @@ def oldwang_screener(
             continue
 
         close = float(g["close"].iloc[-1])
+
+        # RS（相對強度）vs market proxy
+        rs_signal = "N/A"
+        rs_outperf = np.nan
+        rs_slope5 = np.nan
+        if isinstance(mkt_close, pd.DataFrame) and (not mkt_close.empty):
+            try:
+                mm = pd.merge(g[["date", "close"]].copy(), mkt_close.copy(), on="date", how="inner", suffixes=("_s", "_m"))
+                mm["close_s"] = pd.to_numeric(mm["close_s"], errors="coerce")
+                mm["close_m"] = pd.to_numeric(mm["close_m"], errors="coerce")
+                mm = mm.dropna(subset=["close_s", "close_m"]).copy()
+                if not mm.empty:
+                    mm["rs"] = safe_div(mm["close_s"], mm["close_m"], default=np.nan)
+                    mm["rs_ma20"] = mm["rs"].rolling(20).mean()
+                    if len(mm) >= 6 and pd.notna(mm["rs"].iloc[-1]) and pd.notna(mm["rs"].iloc[-6]):
+                        rs_slope5 = float(mm["rs"].iloc[-1] - mm["rs"].iloc[-6])
+
+                    w = int(rs_window)
+                    if len(mm) >= (w + 1) and pd.notna(mm["close_s"].iloc[-1]) and pd.notna(mm["close_s"].iloc[-(w + 1)]) and pd.notna(mm["close_m"].iloc[-1]) and pd.notna(mm["close_m"].iloc[-(w + 1)]):
+                        stock_ret = float(mm["close_s"].iloc[-1] / mm["close_s"].iloc[-(w + 1)] - 1.0)
+                        mkt_ret = float(mm["close_m"].iloc[-1] / mm["close_m"].iloc[-(w + 1)] - 1.0)
+                        rs_outperf = (stock_ret - mkt_ret) * 100.0
+
+                    # RS signal
+                    rs_last = mm["rs"].iloc[-1] if len(mm) else np.nan
+                    rs_ma = mm["rs_ma20"].iloc[-1] if len(mm) else np.nan
+                    if pd.notna(rs_outperf) and rs_outperf >= 0 and pd.notna(rs_slope5) and rs_slope5 > 0 and pd.notna(rs_last) and pd.notna(rs_ma) and rs_last >= rs_ma:
+                        rs_signal = "相對強"
+                    elif pd.notna(rs_outperf) and rs_outperf < 0 and pd.notna(rs_slope5) and rs_slope5 < 0 and pd.notna(rs_last) and pd.notna(rs_ma) and rs_last < rs_ma:
+                        rs_signal = "相對弱"
+                    else:
+                        rs_signal = "中性"
+            except Exception:
+                pass
+
+        # RS 過濾：預設只挑相對強於大盤的股票（避免買到落後股）
+        if bool(require_rs) and rs_signal == "相對弱":
+            continue
+
         g["MA5"] = g["close"].rolling(5).mean()
         g["MA10"] = g["close"].rolling(10).mean()
         g["MA20"] = g["close"].rolling(20).mean()
@@ -2076,6 +2401,14 @@ def oldwang_screener(
         else:
             reasons.append("非領導股")
 
+        # RS（相對強度）加分：買強不買弱（強於大盤者優先）
+        if rs_signal == "相對強":
+            s += 12
+            reasons.append(f"RS{int(rs_window)}強於大盤")
+        elif rs_signal == "相對弱":
+            s -= 12
+            reasons.append(f"RS{int(rs_window)}弱於大盤")
+
         if four:
             s += 25
             reasons.append("四海遊龍")
@@ -2136,6 +2469,8 @@ def oldwang_screener(
             "連兩日破10MA": bool(break10_two_days),
             "縮量警訊": bool(shrink_warn),
             "量價型態": vol_style,
+            f"RS{int(rs_window)}超越大盤(%)": rs_outperf,
+            "RS訊號": rs_signal,
             "老王分數": int(s),
             "理由": " / ".join(reasons),
         })
@@ -2144,6 +2479,15 @@ def oldwang_screener(
         return pd.DataFrame()
 
     out = pd.DataFrame(rows).sort_values(["老王分數", "成交金額(億)"], ascending=[False, False]).head(int(output_top_k)).reset_index(drop=True)
+
+    # RS Rank（在本次輸出中，以 RS outperformance 排名，越高越強）
+    rs_col = f"RS{int(rs_window)}超越大盤(%)"
+    if rs_col in out.columns:
+        try:
+            out["RS Rank(%)"] = pd.to_numeric(out[rs_col], errors="coerce").rank(pct=True) * 100
+        except Exception:
+            out["RS Rank(%)"] = np.nan
+
     out.insert(0, "Rank", range(1, len(out) + 1))
     return out
 
@@ -2159,6 +2503,8 @@ def run_all_features(
     theme_top_k: int,
     theme_money_threshold_yi: float,
     bias_profile_mode: str,
+    market_proxy_id: str,
+    rs_window: int,
     is_holding: bool,
     contrarian_flag: bool,
 ) -> dict:
@@ -2269,11 +2615,28 @@ def run_all_features(
 
     # 9) trade plan engine
     profile = ai.get("profile", "中小型飆股")
+
+    # Market proxy daily series (for Regime & RS)
+    proxy_id = str(market_proxy_id).strip() or "0050"
+    proxy_df = get_daily_one_cached(token, proxy_id, start_date, None)
+    if proxy_df is None:
+        proxy_df = pd.DataFrame()
+    else:
+        proxy_df = proxy_df.copy()
+        proxy_df = normalize_date_col(proxy_df, "date")
+        if "close" in proxy_df.columns:
+            proxy_df["close"] = to_numeric_series(proxy_df["close"])
+
+    market_regime = compute_market_regime(proxy_df, vol_rank, proxy_id)
+    rs_info = compute_relative_strength(res["price_df"], proxy_df, window=int(rs_window))
+    res["market_regime"] = market_regime
+    res["rs_info"] = rs_info
+
     vol_ratio = compute_volume_ratio_from_df(res["price_df"])
     struct = compute_structure(res["price_df"])
     pattern_info = classify_pattern(struct, vol_ratio, profile)
     vol_quality = classify_volume_price(res["price_df"], vol_ratio)
-    plan = build_trade_plan(struct, pattern_info, vol_quality, ai.get("bias_alert", {}), score)
+    plan = build_trade_plan(struct, pattern_info, vol_quality, ai.get("bias_alert", {}), score, market_regime=market_regime, rs_info=rs_info)
 
     # 老王策略：領導股判斷 + 形態/一條線/量價檢核（寫入持股判斷依據）
     leader = compute_leader_status(vol_rank, stock_id)
@@ -2323,6 +2686,8 @@ def run_all_features(
         "leader": leader,
         "oldwang": oldwang,
         "decision": decision,
+        "market_regime": market_regime,
+        "rs_info": rs_info,
 
         "profile": profile,
         "vol_ratio": vol_ratio,
@@ -2346,6 +2711,23 @@ if not token:
 st.sidebar.header("參數")
 target_sid = st.sidebar.text_input("個股代碼", value="2330").strip()
 scan_mode = st.sidebar.selectbox("全市場掃描來源", options=["即時快照（推薦）", "日線（收盤資料）"], index=0)
+
+st.sidebar.divider()
+st.sidebar.subheader("市場狀態 / RS 相對強度")
+_proxy_choice = st.sidebar.selectbox(
+    "大盤代理（用於盤勢 Regime 與 RS 相對強度）",
+    options=["0050 (台灣50)", "006208 (富邦台50)", "自訂"],
+    index=0,
+)
+if _proxy_choice.startswith("0050"):
+    market_proxy_id = "0050"
+elif _proxy_choice.startswith("006208"):
+    market_proxy_id = "006208"
+else:
+    market_proxy_id = st.sidebar.text_input("自訂大盤代理代碼", value="0050").strip()
+
+rs_window = st.sidebar.slider("RS 計算視窗（交易日）", min_value=10, max_value=60, value=20, step=5)
+
 
 st.sidebar.divider()
 st.sidebar.subheader("乖離率警報")
@@ -2381,6 +2763,8 @@ if st.sidebar.button("一鍵更新（含交易計畫引擎）"):
             theme_top_k=theme_top_k,
             theme_money_threshold_yi=theme_money_threshold_yi,
             bias_profile_mode=bias_profile_mode,
+            market_proxy_id=market_proxy_id,
+            rs_window=int(rs_window),
             is_holding=st.session_state.get("is_holding", False),
             contrarian_flag=st.session_state.get("contrarian_flag", False),
         )
@@ -2487,6 +2871,16 @@ with tab1:
             n7.metric("法人5日合計", "-" if chip.get("net_5d_total") is None else f"{float(chip.get('net_5d_total')):,.0f}")
             n8.metric("融資5日變化", "-" if chip.get("margin_delta_5d") is None else f"{float(chip.get('margin_delta_5d')):,.0f}")
 
+            mr = res.get("market_regime", {}) or {}
+            rsx = res.get("rs_info", {}) or {}
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("盤勢 Regime", str(mr.get("label", "-")))
+            m2.metric("大盤>20MA", "是" if mr.get("above_ma20") is True else ("否" if mr.get("above_ma20") is False else "-"))
+            m3.metric("上漲比例(%)", "-" if mr.get("breadth_up_ratio") is None or pd.isna(mr.get("breadth_up_ratio")) else f"{float(mr.get('breadth_up_ratio')):.1f}%")
+            m4.metric(f"RS{int(rsx.get('window', 20))}超越大盤", "-" if rsx.get("outperf_window_pct") is None or pd.isna(rsx.get("outperf_window_pct")) else f"{float(rsx.get('outperf_window_pct')):+.2f}%")
+            if rsx.get("signal") and rsx.get("signal") != "N/A":
+                st.caption(f"RS 訊號：{rsx.get('signal')}（以大盤代理 {mr.get('proxy_id','-')} 計算）")
+
             if vol_ratio is not None and not pd.isna(vol_ratio):
                 st.caption(f"相對量（今/近5日均量）：{float(vol_ratio):.2f}")
 
@@ -2588,6 +2982,14 @@ with tab2:
             st.error("族群資金流向資料為空。")
         else:
             st.caption(f"資料來源：{meta.get('source','')}；掃描日期：{meta.get('scan_date','')}")
+
+        mr = res.get("market_regime", {}) or {}
+        if mr.get("label"):
+            br = mr.get("breadth_up_ratio")
+            if br is not None and not pd.isna(br):
+                st.caption(f"盤勢 Regime：{mr.get('label')}（上漲比例 {float(br):.1f}%）｜大盤代理：{mr.get('proxy_id','-')}")
+            else:
+                st.caption(f"盤勢 Regime：{mr.get('label')}｜大盤代理：{mr.get('proxy_id','-')}")
             show = sector_flow.head(10).copy()
             show["資金流向(億)"] = show["signed_money"] / 1e8
             show = show.rename(columns={"industry_category": "族群"})
@@ -2828,7 +3230,14 @@ with tab5:
             st.error("交易計畫引擎資料不足。")
         else:
             vol_ratio = te.get("vol_ratio")
-            st.caption(f"股票屬性：{te.get('profile','-')}；相對量（今/近5日均量）：{vol_ratio:.2f}" if vol_ratio is not None else f"股票屬性：{te.get('profile','-')}；相對量：N/A")
+            mr = te.get("market_regime", res.get("market_regime", {})) if isinstance(te, dict) else {}
+            rsx = te.get("rs_info", res.get("rs_info", {})) if isinstance(te, dict) else {}
+            cap1 = f"股票屬性：{te.get('profile','-')}；相對量：{float(vol_ratio):.2f}" if vol_ratio is not None and not pd.isna(vol_ratio) else f"股票屬性：{te.get('profile','-')}；相對量：N/A"
+            cap2 = f"｜盤勢：{(mr or {}).get('label','-')}（上漲比例 {(mr or {}).get('breadth_up_ratio', np.nan):.1f}%）" if (mr or {}).get('breadth_up_ratio') is not None and not pd.isna((mr or {}).get('breadth_up_ratio')) else f"｜盤勢：{(mr or {}).get('label','-')}"
+            op = (rsx or {}).get('outperf_window_pct')
+            w = int((rsx or {}).get('window', 20))
+            cap3 = f"｜RS{w}：{(rsx or {}).get('signal','-')}（超越大盤 {float(op):+.2f}%）" if op is not None and not pd.isna(op) else f"｜RS{w}：{(rsx or {}).get('signal','-')}"
+            st.caption(cap1 + cap2 + cap3)
 
             # Plan text
             st.markdown(plan.get("summary", ""))
@@ -2924,6 +3333,11 @@ with tab6:
         require_pattern = c5.selectbox("型態過濾", ["不限", "三陽開泰", "四海遊龍"], index=0)
         require_breakout = c6.checkbox("只挑『突破前高且帶量』", value=False)
 
+        c7, c8 = st.columns(2)
+        require_rs = c7.checkbox(f"只挑 RS 強於大盤（以 {market_proxy_id}）", value=True)
+        rs_window_local = c8.slider("RS 視窗（交易日）", min_value=10, max_value=60, value=int(rs_window), step=5)
+
+
         run_btn = st.button("🚀 執行老王選股器", type="primary")
 
         if "oldwang_screener_df" not in st.session_state:
@@ -2943,6 +3357,9 @@ with tab6:
                         require_leader=bool(require_leader),
                         require_pattern=str(require_pattern),
                         require_breakout=bool(require_breakout),
+                        market_proxy_id=str(market_proxy_id),
+                        rs_window=int(rs_window_local),
+                        require_rs=bool(require_rs),
                         min_money_yi=float(min_money_yi),
                     )
                 st.session_state["oldwang_screener_df"] = df_pick
