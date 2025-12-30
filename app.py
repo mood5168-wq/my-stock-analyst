@@ -12,8 +12,8 @@ import streamlit as st
 # -----------------------------
 # Streamlit config
 # -----------------------------
-st.set_page_config(page_title="超級分析師-Pro", layout="wide")
-st.title("超級分析師-Pro
+st.set_page_config(page_title="超級分析師-Pro（七大功能 + 第八分類 + 交易計畫引擎）", layout="wide")
+st.title("超級分析師-Pro（七大功能 + 第八分類 + 交易計畫引擎）")
 
 # -----------------------------
 # Timezone
