@@ -22,10 +22,13 @@ if "FINMIND_USER_ID" in st.secrets:
                 login_ok = True
             except: pass
 
-# --- 3. 核心功能：十大族群資金流向 (防禦性編程優化) ---
+# --- 3. 核心功能：十大族群資金流向 (防禦性架構) ---
 @st.cache_data(ttl=300)
 def get_all_sector_flows():
-    if not login_ok: return pd.DataFrame()
+    # 預設乾淨的欄位結構，防止 KeyError
+    default_df = pd.DataFrame(columns=["族群", "平均漲跌%", "資金熱度(張)"])
+    if not login_ok: return default_df
+    
     sectors = {
         "半導體設備": ["2330", "1560", "3131", "3583", "6139"],
         "AI伺服器": ["2382", "3231", "2376", "6669", "2356"],
@@ -39,32 +42,28 @@ def get_all_sector_flows():
         "金融/權值": ["2881", "2882", "2891", "2884", "2886"]
     }
     
-    flow_results = []
     try:
         snap_df = dl.taiwan_stock_daily_snapshot()
-        if snap_df.empty:
-            return pd.DataFrame(columns=["族群", "平均漲跌%", "資金熱度(張)"])
-            
+        if snap_df.empty: return default_df
+        
+        flow_results = []
         for name, sids in sectors.items():
             targets = snap_df[snap_df['stock_id'].isin(sids)]
             if not targets.empty:
                 avg_chg = targets['tv_change_rate'].mean()
                 total_vol = targets['volume'].sum()
                 flow_results.append({
-                    "族群": name, 
-                    "平均漲跌%": round(avg_chg, 2) if not pd.isna(avg_chg) else 0.0, 
+                    "族群": name,
+                    "平均漲跌%": round(avg_chg, 2) if not pd.isna(avg_chg) else 0.0,
                     "資金熱度(張)": int(total_vol/1000)
                 })
-    except Exception as e:
-        print(f"Sector scan error: {e}")
-    
-    if not flow_results:
-        return pd.DataFrame(columns=["族群", "平均漲跌%", "資金熱度(張)"])
         
-    df = pd.DataFrame(flow_results)
-    return df.sort_values(by="平均漲跌%", ascending=False)
+        if not flow_results: return default_df
+        return pd.DataFrame(flow_results).sort_values(by="平均漲跌%", ascending=False)
+    except:
+        return default_df
 
-# --- 4. 核心功能：個股深度診斷與 12/30 即時補丁 ---
+# --- 4. 核心功能：個股深度資料與 12/30 快照補丁 ---
 @st.cache_data(ttl=60)
 def get_stock_data_pro(sid):
     today = datetime.now().strftime("%Y-%m-%d")
@@ -74,7 +73,7 @@ def get_stock_data_pro(sid):
         c = dl.taiwan_stock_institutional_investors(stock_id=sid, start_date=start)
         m = dl.taiwan_stock_margin_purchase_short_sale(stock_id=sid, start_date=start)
         
-        # 強制 12/30 補丁
+        # 強製 12/30 補丁 (Pro 快照接口)
         snap_df = dl.taiwan_stock_daily_snapshot()
         snap = snap_df[snap_df['stock_id'] == sid]
         if not t.empty and not snap.empty and t['date'].iloc[-1] != today:
@@ -92,36 +91,45 @@ def get_stock_data_pro(sid):
         return t, c, m
     except: return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
-# --- 5. UI 介面佈局 ---
+# --- 5. UI 介面 ---
 st.title("🏹 超級分析師：Sponsor Pro 終極戰情室")
 target_sid = st.sidebar.text_input("輸入個股代碼", "1560")
 
 if login_ok:
-    # --- Tab 0: 十大族群資金流向 ---
+    # A. 十大族群資金流向
     st.subheader("🌊 今日全市場十大族群資金流向")
     flow_df = get_all_sector_flows()
-    if not flow_df.empty and "平均漲跌%" in flow_df.columns:
-        c1, c2 = st.columns([2, 1])
-        with c1:
+    if not flow_df.empty:
+        col_chart, col_data = st.columns([2, 1])
+        with col_chart:
             fig_flow = px.bar(flow_df, x="族群", y="平均漲跌%", color="平均漲跌%",
                                color_continuous_scale='RdYlGn', text="平均漲跌%")
             st.plotly_chart(fig_flow, use_container_width=True)
-        with c2:
+        with col_data:
             st.dataframe(flow_df, hide_index=True, use_container_width=True)
     else:
-        st.info("⌛ 盤中資料準備中，請稍候或手動刷新。")
+        st.info("⌛ 目前非交易時段或資料獲取中，請稍候。")
 
     st.markdown("---")
     
-    # --- 個股深度診斷 ---
+    # B. 個股診斷區
     t_df, c_df, m_df = get_stock_data_pro(target_sid)
     if not t_df.empty and 'MA20' in t_df.columns:
         last = t_df.iloc[-1]
-        st.markdown(f"### 🎯 {target_sid} 深度診斷")
-        st.metric("最新成交價", f"${last['close']}", delta=f"{round(last['close']-t_df['close'].iloc[-2], 2)}")
-        st.write(f"數據日期: **{last['date']}**")
+        st.markdown(f"### 🎯 {target_sid} 深度即時分析")
+        
+        # 儀表板
+        i1, i2, i3 = st.columns(3)
+        with i1:
+            st.metric("最新成交價", f"${last['close']}", delta=f"{round(last['close']-t_df['close'].iloc[-2], 2)}")
+            st.write(f"數據日期: **{last['date']}**")
+        with i2:
+            st.metric("月線趨勢", "🟢 上揚" if last['Slope20'] > 0 else "🔴 下彎")
+        with i3:
+            avg_v = t_df['Trading_Volume'].iloc[-6:-1].mean()
+            st.metric("今日相對量", f"{round(last['Trading_Volume']/(avg_v+1), 2)}x")
 
-        tabs = st.tabs(["📉 三線扣抵圖", "🔥 籌碼照妖鏡", "🚀 全台相對大量榜"])
+        tabs = st.tabs(["📉 技術三線扣抵", "🔥 籌碼照妖鏡", "🚀 全台相對大量榜"])
         
         with tabs[0]:
             fig = go.Figure()
@@ -131,19 +139,17 @@ if login_ok:
             if len(t_df) > 21:
                 fig.add_trace(go.Scatter(x=[t_df['date'].iloc[-21]], y=[last['MA20_Ref']], mode='markers', name='月扣抵', marker=dict(size=12, color='yellow', symbol='x')))
             fig.update_layout(template="plotly_dark", height=450); st.plotly_chart(fig, use_container_width=True)
-            
+
         with tabs[1]:
             if not c_df.empty:
                 st.plotly_chart(px.bar(c_df[c_df['name'].isin(['Foreign_Investor','Investment_Trust'])], x='date', y='net_buy', color='name', barmode='group', title="法人買賣超"), use_container_width=True)
             if not m_df.empty and 'MarginPurchaseStock' in m_df.columns:
-                st.plotly_chart(px.line(m_df, x='date', y='MarginPurchaseStock', title="散戶融資餘額"), use_container_width=True)
+                st.plotly_chart(px.line(m_df, x='date', y='MarginPurchaseStock', title="散戶融資照妖鏡"), use_container_width=True)
 
         with tabs[2]:
             st.subheader("🔥 今日全台股相對大量排行榜")
             try:
                 all_snap = dl.taiwan_stock_daily_snapshot()
-                all_snap['相對量能'] = round(all_snap['volume'] / (all_snap['last_close_volume'] + 1e-9), 2)
-                st.dataframe(all_snap[all_snap['volume']>500000].sort_values('相對量能', ascending=False).head(15)[['stock_id','stock_name','last_close','相對量能']], hide_index=True)
-            except: st.write("量能資料暫時無法讀取")
-else:
-    st.error("登入失敗，請確認 Secrets 設定。")
+                all_snap['相對量'] = round(all_snap['volume'] / (all_snap['last_close_volume'] + 1), 2)
+                st.dataframe(all_snap[all_snap['volume']>500000].sort_values('相對量', ascending=False).head(15)[['stock_id','stock_name','last_close','相對量']], hide_index=True)
+            except: st.write("量能資料準備中...")
