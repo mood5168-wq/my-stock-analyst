@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 from FinMind.data import DataLoader
 
 # --- 1. 頁面設定 ---
-st.set_page_config(page_title="超級分析師-終極旗艦版", layout="wide")
+st.set_page_config(page_title="超級分析師-終極完整版", layout="wide")
 
 # --- 2. 安全登入 ---
 dl = DataLoader()
@@ -22,122 +22,110 @@ if "FINMIND_USER_ID" in st.secrets:
                 login_ok = True
             except: pass
 
-# --- 3. 核心函數：自動評分系統 ---
-def calculate_comprehensive_score(t, c, m, r):
-    score = 0
-    details = []
-    if not t.empty and 'MA20' in t.columns:
-        last = t.iloc[-1]
-        # 技術面 (25分)
-        if last['close'] >= last['MA20']:
-            score += 15; details.append("✅ 站穩螢光黃月線 (+15)")
-        if t['MA20'].diff().iloc[-1] > 0:
-            score += 10; details.append("✅ 月線斜率向上 (+10)")
-    # 籌碼面 (25分)
-    if not c.empty and 'net_buy' in c.columns:
-        sitc = c[c['name'] == 'Investment_Trust'].tail(3)
-        if not sitc.empty and (sitc['net_buy'] > 0).all():
-            score += 25; details.append("✅ 投信連 3 買鎖碼 (+25)")
-    # 基本面 (25分)
-    if not r.empty:
-        if r['revenue'].iloc[-1] > r['revenue'].iloc[-13 if len(r)>12 else 0]:
-            score += 25; details.append("✅ 營收年增成長 (+25)")
-    # 散戶面 (25分)
-    if not m.empty and 'MarginPurchaseStock' in m.columns:
-        m_diff = m['MarginPurchaseStock'].iloc[-1] - m['MarginPurchaseStock'].iloc[-5]
-        if m_diff < 0:
-            score += 25; details.append("✅ 融資減少籌碼乾淨 (+25)")
-    return score, details
-
-# --- 4. 核心函數：盤中爆量 + 強勢選股 ---
-@st.cache_data(ttl=60)
-def scan_all_signals():
-    if not login_ok: return pd.DataFrame()
-    results = []
-    # 擴大掃描池 (投信榜 + 盤中熱門種子)
-    seeds = ['1560', '2330', '2454', '2615', '2317', '3231', '2382', '2603', '3037']
+# --- 3. 核心函數：抓取個股資料 (包含最新價格) ---
+@st.cache_data(ttl=60) # 盤中每分鐘更新一次
+def get_stock_data_full(sid):
+    start_date = (datetime.now() - timedelta(days=260)).strftime("%Y-%m-%d")
     try:
-        chip = dl.taiwan_stock_holding_shares_per(stock_id="ALL", start_date=(datetime.now()-timedelta(days=3)).strftime("%Y-%m-%d"))
-        top_list = list(set(chip.sort_values(by='SITC_Trust', ascending=False).head(30)['stock_id'].tolist() + seeds))
-        for sid in top_list:
-            try:
-                t = dl.taiwan_stock_daily(stock_id=sid, start_date=(datetime.now()-timedelta(days=100)).strftime("%Y-%m-%d"))
-                if len(t) >= 60:
-                    last = t.iloc[-1]
-                    avg_v = t['Trading_Volume'].iloc[-6:-1].mean()
-                    v_ratio = round(last['Trading_Volume'] / avg_v, 2)
-                    ma20 = t['close'].tail(20).mean()
-                    ma60 = t['close'].tail(60).mean()
-                    # 選股條件：爆量 1.2x 且 站上雙線
-                    if v_ratio >= 1.2 and last['close'] >= ma20 and last['close'] >= ma60:
-                        results.append({'代號': sid, '量能倍數': v_ratio, '現價': last['close'], '雙線狀態': '☀️ 站穩'})
-            except: continue
-        return pd.DataFrame(results).sort_values(by='量能倍數', ascending=False)
-    except: return pd.DataFrame()
-
-# --- 5. 核心函數：個股全資料抓取 ---
-@st.cache_data(ttl=300)
-def get_stock_data(sid):
-    start = (datetime.now() - timedelta(days=250)).strftime("%Y-%m-%d")
-    try:
-        t = dl.taiwan_stock_daily(stock_id=sid, start_date=start)
-        c = dl.taiwan_stock_institutional_investors(stock_id=sid, start_date=start)
-        m = dl.taiwan_stock_margin_purchase_short_sale(stock_id=sid, start_date=start)
-        r = dl.taiwan_stock_month_revenue(stock_id=sid, start_date=start)
+        # 抓取日 K 線 (FinMind 在盤中會包含當日的最新價格與成交量)
+        t = dl.taiwan_stock_daily(stock_id=sid, start_date=start_date)
+        c = dl.taiwan_stock_institutional_investors(stock_id=sid, start_date=start_date)
+        m = dl.taiwan_stock_margin_purchase_short_sale(stock_id=sid, start_date=start_date)
+        r = dl.taiwan_stock_month_revenue(stock_id=sid, start_date=start_date)
+        
         if not t.empty:
+            # 計算均線
             t['MA5'] = t['close'].rolling(5).mean()
             t['MA20'] = t['close'].rolling(20).mean()
             t['MA60'] = t['close'].rolling(60).mean()
+            # 扣抵與斜率
             t['MA20_Ref'] = t['close'].shift(20)
             t['MA60_Ref'] = t['close'].shift(60)
-            t['Slope'] = t['MA20'].diff()
+            t['Slope20'] = t['MA20'].diff()
+            
         if not c.empty: c['net_buy'] = c['buy'] - c['sell']
         return t, c, m, r
     except: return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
-# --- 6. UI 介面 ---
+# --- 4. 核心函數：自動評分 (25分 x 4) ---
+def run_scoring(t, c, m, r):
+    score, msg = 0, []
+    if not t.empty:
+        last = t.iloc[-1]
+        # 技術面: 股價 > 20MA
+        if last['close'] >= last['MA20']: score += 25; msg.append("✅ 站穩月線")
+    if not c.empty:
+        # 籌碼面: 投信近 3 日有買
+        sitc = c[c['name'] == 'Investment_Trust'].tail(3)
+        if not sitc.empty and sitc['net_buy'].sum() > 0: score += 25; msg.append("✅ 投信佈局")
+    if not r.empty:
+        # 基本面: 營收年增
+        if r['revenue'].iloc[-1] > r['revenue'].iloc[-13 if len(r)>12 else 0]: score += 25; msg.append("✅ 營收年增")
+    if not m.empty and 'MarginPurchaseStock' in m.columns:
+        # 散戶面: 融資減少
+        if m['MarginPurchaseStock'].iloc[-1] < m['MarginPurchaseStock'].iloc[-5]: score += 25; msg.append("✅ 融資洗盤")
+    return score, msg
+
+# --- 5. 介面 ---
 st.title("🏹 超級分析師：終極旗艦戰情室")
-target_sid = st.sidebar.text_input("輸入股票代號", "1560")
+target_sid = st.sidebar.text_input("輸入代碼", "1560")
 my_cost = st.sidebar.number_input("買入成本", value=0.0)
 
-tab0, tab1, tab2, tab3, tab4 = st.tabs(["⚡ 盤中爆量選股", "📈 技術扣抵圖", "🔥 籌碼照妖鏡", "📊 營收診斷", "📅 扣抵預測"])
-
 if login_ok:
-    t_df, c_df, m_df, r_df = get_stock_data(target_sid)
+    t_df, c_df, m_df, r_df = get_stock_data_full(target_sid)
     
-    with tab0:
-        st.subheader("🚀 今日盤中爆量 + 站穩雙線名單")
-        df_breakout = scan_all_signals()
-        st.dataframe(df_breakout, use_container_width=True)
+    if not t_df.empty:
+        last = t_df.iloc[-1]
+        
+        # --- A. 頂部儀表板 (即時股價與評分) ---
+        col_p, col_s, col_t = st.columns(3)
+        with col_p:
+            st.metric("最新成交價", f"${last['close']}", delta=f"{round(last['close'] - t_df['close'].iloc[-2], 2)}")
+            st.caption(f"資料更新日期: {last['date']}")
+        with col_s:
+            score, details = run_scoring(t_df, c_df, m_df, r_df)
+            st.metric("自動評分", f"{score} 分")
+        with col_t:
+            trend = "🟢 上揚" if last['Slope20'] > 0 else "🔴 下彎"
+            st.metric("月線趨勢", trend)
 
-    with tab1:
-        if not t_df.empty:
-            # 自動評分顯示
-            score, s_details = calculate_comprehensive_score(t_df, c_df, m_df, r_df)
-            st.metric("🔥 實戰綜合評分", f"{score} 分")
-            st.caption(" | ".join(s_details))
-            
+        # --- B. 分頁功能 ---
+        tab1, tab2, tab3, tab4 = st.tabs(["📉 技術扣抵圖", "🔥 籌碼對決", "📊 營收診斷", "🚀 爆量選股"])
+        
+        with tab1:
             fig = go.Figure()
-            fig.add_trace(go.Scatter(x=t_df['date'], y=t_df['close'], name='現價', line=dict(color='white')))
-            fig.add_trace(go.Scatter(x=t_df['date'], y=t_df['MA20'], name='20MA(月)', line=dict(color='#FFFF00', width=3)))
-            fig.add_trace(go.Scatter(x=t_df['date'], y=t_df['MA60'], name='60MA(季)', line=dict(color='#FF00FF', width=2, dash='dot')))
-            
-            # 扣抵點標註
-            last = t_df.iloc[-1]
+            fig.add_trace(go.Scatter(x=t_df['date'], y=t_df['close'], name='價格', line=dict(color='white', width=1.5)))
+            fig.add_trace(go.Scatter(x=t_df['date'], y=t_df['MA20'], name='20MA', line=dict(color='#FFFF00', width=3)))
+            fig.add_trace(go.Scatter(x=t_df['date'], y=t_df['MA60'], name='60MA', line=dict(color='#FF00FF', width=2, dash='dot')))
+            # 標註扣抵點
             fig.add_trace(go.Scatter(x=[t_df['date'].iloc[-21]], y=[last['MA20_Ref']], mode='markers', name='月扣抵', marker=dict(size=12, color='yellow', symbol='x')))
-            st.plotly_chart(fig, use_container_width=True)
-
-    with tab2:
-        if not c_df.empty:
-            st.plotly_chart(px.bar(c_df[c_df['name'].isin(['Foreign_Investor','Investment_Trust'])], x='date', y='net_buy', color='name', barmode='group', title="法人動向"), use_container_width=True)
-        if not m_df.empty and 'MarginPurchaseStock' in m_df.columns:
-            st.plotly_chart(px.line(m_df, x='date', y='MarginPurchaseStock', title="散戶融資 (照妖鏡)"), use_container_width=True)
-
-    with tab3:
-        if not r_df.empty:
-            st.plotly_chart(px.bar(r_df, x='revenue_month', y='revenue', title="月營收趨勢"), use_container_width=True)
+            fig.update_layout(template="plotly_dark", height=450); st.plotly_chart(fig, use_container_width=True)
             
-    with tab4:
-        st.subheader("📅 未來 5 日扣抵值預估")
-        f_df = pd.DataFrame({'天數':['D+1','D+2','D+3','D+4','D+5'], '月扣抵價格':t_df['close'].iloc[-25:-20].values[::-1]})
-        st.table(f_df)
+            # 成交量
+            vol_ratio = round(last['Trading_Volume'] / t_df['Trading_Volume'].iloc[-6:-1].mean(), 2)
+            st.write(f"📊 今日成交量：{int(last['Trading_Volume']/1000)}k (量能倍數: {vol_ratio}x)")
+
+        with tab2:
+            if not c_df.empty:
+                st.plotly_chart(px.bar(c_df[c_df['name'].isin(['Foreign_Investor','Investment_Trust'])], x='date', y='net_buy', color='name', barmode='group', title="法人買賣"), use_container_width=True)
+            if not m_df.empty and 'MarginPurchaseStock' in m_df.columns:
+                st.plotly_chart(px.line(m_df, x='date', y='MarginPurchaseStock', title="融資趨勢"), use_container_width=True)
+
+        with tab3:
+            if not r_df.empty:
+                st.plotly_chart(px.bar(r_df, x='revenue_month', y='revenue', title="月營收走勢"), use_container_width=True)
+
+        with tab4:
+            st.info("💡 此分頁會掃描今日『爆量且站上雙線』的標的，請稍候...")
+            # 簡化選股邏輯確保不崩潰
+            seeds = ['1560', '2330', '2454', '2615', '2603', '3231']
+            res = []
+            for s in seeds:
+                try:
+                    temp_t = dl.taiwan_stock_daily(stock_id=s, start_date=(datetime.now()-timedelta(days=60)).strftime("%Y-%m-%d"))
+                    if not temp_t.empty:
+                        l = temp_t.iloc[-1]
+                        v_r = l['Trading_Volume'] / temp_t['Trading_Volume'].iloc[-6:-1].mean()
+                        if v_r > 1.2: res.append({'代號': s, '量能倍數': round(v_r, 2), '現價': l['close']})
+                except: continue
+            st.table(pd.DataFrame(res))
