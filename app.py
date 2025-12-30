@@ -820,6 +820,7 @@ def compute_oldwang_signals(stock_id: str, price_df: pd.DataFrame, profile: str)
     """
     out = {
         "ma5": np.nan, "ma10": np.nan, "ma20": np.nan, "ma60": np.nan,
+        "above_ma5": None, "above_ma10": None, "above_ma20": None, "above_ma60": None,
         "tri": False, "tri_strong": False, "four": False,
         "key_ma": 10, "key_hold": False, "key_break_2d": False,
         "breakout_need_volume": False, "post_surge_volume_ok": None,
@@ -835,6 +836,13 @@ def compute_oldwang_signals(stock_id: str, price_df: pd.DataFrame, profile: str)
     if "Trading_Volume" in df.columns:
         df["Trading_Volume"] = pd.to_numeric(df["Trading_Volume"], errors="coerce")
     df = ensure_change_rate(df)
+
+    # ensure chronological order for rolling calculations
+    if "date" in df.columns:
+        try:
+            df = df.sort_values("date")
+        except Exception:
+            pass
 
     # MA
     df["MA5"] = df["close"].rolling(5).mean()
@@ -853,13 +861,28 @@ def compute_oldwang_signals(stock_id: str, price_df: pd.DataFrame, profile: str)
     close = float(last["close"]) if pd.notna(last["close"]) else np.nan
     ma5, ma10, ma20, ma60 = out["ma5"], out["ma10"], out["ma20"], out["ma60"]
 
+    # explicit "above MA" flags for transparency/debug
+    if pd.notna(close) and pd.notna(ma5):
+        out["above_ma5"] = bool(close >= ma5)
+    if pd.notna(close) and pd.notna(ma10):
+        out["above_ma10"] = bool(close >= ma10)
+    if pd.notna(close) and pd.notna(ma20):
+        out["above_ma20"] = bool(close >= ma20)
+    if pd.notna(close) and pd.notna(ma60):
+        out["above_ma60"] = bool(close >= ma60)
+
     # 三陽開泰 / 四海遊龍
     if pd.notna(close) and all(pd.notna(x) for x in [ma5, ma10, ma20]):
-        out["tri"] = (close > ma5) and (close > ma10) and (close > ma20)
+        out["tri"] = (close >= ma5) and (close >= ma10) and (close >= ma20)
         out["tri_strong"] = out["tri"] and (ma5 > ma10 > ma20)
 
     if pd.notna(close) and all(pd.notna(x) for x in [ma5, ma10, ma20, ma60]):
-        out["four"] = (close > ma5) and (close > ma10) and (close > ma20) and (close > ma60)
+        out["four"] = out["tri"] and (close >= ma60)
+
+    # If user feels "above all MAs" but signals are off, this note explains the short MA gate
+    if (not out["tri"] or not out["four"]) and pd.notna(close) and pd.notna(ma20) and pd.notna(ma60):
+        if (close >= ma20) and (close >= ma60) and ((pd.notna(ma5) and close < ma5) or (pd.notna(ma10) and close < ma10)):
+            out["notes"].append("價格在20/60MA之上，但尚未重新站回5/10MA，因此三陽開泰/四海遊龍未成立")
 
     # 一條線策略：預設大型權值股與記憶體/面板主題用 10MA
     if profile == "大型權值股" or hit_theme(stock_id, "記憶體族群") or hit_theme(stock_id, "面板族群"):
@@ -2439,6 +2462,20 @@ with tab7:
                 "長黑洗盤提示": ow.get("washout_ignore"),
             }]
             st.dataframe(pd.DataFrame(sig_rows), use_container_width=True)
+
+            # 均線明細（避免只看20/60就誤以為站上所有均線）
+            ma_rows = [{
+                "收盤": te.get("structure", {}).get("close"),
+                "MA5": ow.get("ma5"),
+                "MA10": ow.get("ma10"),
+                "MA20": ow.get("ma20"),
+                "MA60": ow.get("ma60"),
+                "收盤>=MA5": ow.get("above_ma5"),
+                "收盤>=MA10": ow.get("above_ma10"),
+                "收盤>=MA20": ow.get("above_ma20"),
+                "收盤>=MA60": ow.get("above_ma60"),
+            }]
+            st.dataframe(pd.DataFrame(ma_rows), use_container_width=True)
 
             if dc.get("reasons"):
                 st.write("依據：")
