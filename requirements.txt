@@ -1,6 +1,6 @@
 streamlit
 pandas
+numpy
 plotly
-FinMind>=1.6.1
-tqdm
+requests
 
