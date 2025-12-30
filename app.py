@@ -12,8 +12,8 @@ import streamlit as st
 # -----------------------------
 # Streamlit config
 # -----------------------------
-st.set_page_config(page_title="超級分析師-Pro（七大功能完整版）", layout="wide")
-st.title("超級分析師-Pro（七大功能完整版）")
+st.set_page_config(page_title="超級分析師-Pro（七大功能 + 第八分類）", layout="wide")
+st.title("超級分析師-Pro（七大功能 + 第八分類：主題族群資金雷達）")
 
 # -----------------------------
 # Timezone
@@ -24,6 +24,24 @@ try:
 except Exception:
     TZ = None  # fallback
 
+# -----------------------------
+# 第八分類：主題族群定義（可自行調整名單）
+# -----------------------------
+THEME_GROUPS = {
+    # 用產業類別抓：半導體、金融
+    "半導體族群": {"industry": ["半導體業"], "stocks": []},
+    "金融族群": {"industry": ["金融保險業"], "stocks": ["2881","2882","2891","2886","2884","2885","2880","2887","2892"]},
+
+    # 用成分股抓：主題族群（可自行增減）
+    "記憶體族群": {"industry": [], "stocks": ["2408","2344","2337","3260","8299","3006","4967"]},
+    "PCB族群": {"industry": [], "stocks": ["3037","8046","2313","2368","4958","2383","6213","3189","6274"]},
+    # CPO/高速光通訊（名單可依你習慣修正）
+    "CPO族群": {"industry": [], "stocks": ["4979","3081","3163","3363","4909","3450","2345"]},
+    "航運族群": {"industry": [], "stocks": ["2603","2609","2615","2606","2605","2637","2617","5608","2641"]},
+    "伺服器族群": {"industry": [], "stocks": ["2382","3231","6669","2356","2317","2324","3706","2376","4938"]},
+    "散熱族群": {"industry": [], "stocks": ["3017","3324","3653","2421","3338","6230"]},
+    "電力重電": {"industry": [], "stocks": ["1519","1513","1503","1504","1514","1609","1617"]},
+}
 
 # -----------------------------
 # FinMind REST helpers (stable + timeout)
@@ -117,6 +135,48 @@ def safe_div(a, b, default=np.nan):
         return default
 
 
+def ensure_change_rate(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    保證 df 有 change_rate（%）
+    - snapshot 通常直接有 change_rate
+    - 日線用 spread/close 推回
+    """
+    if df is None or df.empty:
+        return df
+    df = df.copy()
+
+    if "change_rate" in df.columns and not df["change_rate"].isna().all():
+        df["change_rate"] = pd.to_numeric(df["change_rate"], errors="coerce").fillna(0.0)
+        return df
+
+    if "spread" in df.columns and "close" in df.columns:
+        close = pd.to_numeric(df["close"], errors="coerce")
+        spread = pd.to_numeric(df["spread"], errors="coerce").fillna(0.0)
+        prev_close = (close - spread).replace(0, np.nan)
+        df["change_rate"] = (spread / prev_close) * 100.0
+        df["change_rate"] = df["change_rate"].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        return df
+
+    df["change_rate"] = 0.0
+    return df
+
+
+def pick_money_col(df: pd.DataFrame) -> str:
+    for c in ["total_amount", "Trading_money", "amount", "Trading_amount"]:
+        if c in df.columns:
+            return c
+    df["money"] = 0.0
+    return "money"
+
+
+def pick_volume_col(df: pd.DataFrame) -> str:
+    for c in ["total_volume", "Trading_Volume", "volume"]:
+        if c in df.columns:
+            return c
+    df["vol"] = 0.0
+    return "vol"
+
+
 # -----------------------------
 # Cached downloads
 # -----------------------------
@@ -194,7 +254,6 @@ def patch_daily_with_snapshot(daily_df: pd.DataFrame, snap_row: pd.Series) -> tu
         return daily_df, False, ""
 
     daily_df = normalize_date_col(daily_df.copy(), "date")
-
     snap_dt = pd.to_datetime(snap_row.get("date"))
     snap_date = snap_dt.strftime("%Y-%m-%d") if not pd.isna(snap_dt) else _now_date_str()
 
@@ -205,7 +264,6 @@ def patch_daily_with_snapshot(daily_df: pd.DataFrame, snap_row: pd.Series) -> tu
     new_row = {c: np.nan for c in daily_df.columns}
     new_row["date"] = snap_date
 
-    # Snapshot -> TaiwanStockPrice mapping
     for k_from, k_to in [
         ("open", "open"),
         ("high", "max"),
@@ -284,7 +342,7 @@ def compute_score(t: pd.DataFrame) -> dict:
                 momentum = max(0, momentum - 5)
     out["momentum"] = float(momentum)
 
-    # Volume (0-25): today vs last 5 days
+    # Volume (0-25)
     vol_score = 0
     if "Trading_Volume" in df.columns and len(df) >= 6:
         v_now = df["Trading_Volume"].iloc[-1]
@@ -384,10 +442,8 @@ def compute_sector_flow_from_snapshot(snapshot_all: pd.DataFrame, stock_info: pd
         sign = 0.0
 
     df["signed_money"] = df[amount_col] * sign
-
     g = df.groupby("industry_category", as_index=False)["signed_money"].sum()
-    g = g.sort_values("signed_money", ascending=False)
-    return g
+    return g.sort_values("signed_money", ascending=False)
 
 
 def compute_volume_ranking_from_snapshot(snapshot_all: pd.DataFrame, stock_info: pd.DataFrame) -> pd.DataFrame:
@@ -412,8 +468,7 @@ def compute_volume_ranking_from_snapshot(snapshot_all: pd.DataFrame, stock_info:
         if c in df.columns:
             df[c] = to_numeric_series(df[c])
 
-    df = df.sort_values("volume_ratio", ascending=False)
-    return df
+    return df.sort_values("volume_ratio", ascending=False)
 
 
 def compute_last_n_trading_dates(token: str, n: int = 6) -> list[str]:
@@ -427,7 +482,6 @@ def compute_last_n_trading_dates(token: str, n: int = 6) -> list[str]:
     except Exception:
         pass
 
-    # brute-force fallback
     out: list[str] = []
     d0 = datetime.now(tz=TZ) if TZ else datetime.now()
     for i in range(0, 35):
@@ -443,7 +497,7 @@ def compute_last_n_trading_dates(token: str, n: int = 6) -> list[str]:
     return sorted(out)[-n:]
 
 
-def compute_sector_flow_from_daily(token: str, stock_info: pd.DataFrame, date_str: str, prev_date_str: Optional[str]) -> pd.DataFrame:
+def compute_sector_flow_from_daily(token: str, stock_info: pd.DataFrame, date_str: str) -> pd.DataFrame:
     today_df = get_daily_all_cached(token, date_str)
     if today_df is None or today_df.empty:
         raise ValueError(f"無法取得 {date_str} 全市場日線資料")
@@ -468,10 +522,8 @@ def compute_sector_flow_from_daily(token: str, stock_info: pd.DataFrame, date_st
         sign = 0.0
 
     df["signed_money"] = df[money_col] * sign
-
     g = df.groupby("industry_category", as_index=False)["signed_money"].sum()
-    g = g.sort_values("signed_money", ascending=False)
-    return g
+    return g.sort_values("signed_money", ascending=False)
 
 
 def compute_volume_ranking_from_daily(token: str, stock_info: pd.DataFrame, dates: list[str]) -> pd.DataFrame:
@@ -516,7 +568,7 @@ def compute_volume_ranking_from_daily(token: str, stock_info: pd.DataFrame, date
 
 
 # -----------------------------
-# NEW: sector leaders (量大 + 漲勢大)
+# NEW: 十大族群內「量大 + 漲勢大」代表股
 # -----------------------------
 def build_sector_leaders(
     vol_rank: pd.DataFrame,
@@ -525,13 +577,7 @@ def build_sector_leaders(
     k: int = 5,
     only_up: bool = True,
 ) -> dict:
-    """
-    針對 Top10 族群，抓出每族群當日「量大且漲勢大」的股票 Top k。
-    vol_rank: 全市場相對大量榜（需含 industry_category, stock_id, stock_name, volume_ratio）
-    sector_flow: 族群資金流向（需含 industry_category, signed_money）
-    """
     out = {}
-
     if vol_rank is None or vol_rank.empty or sector_flow is None or sector_flow.empty:
         return out
 
@@ -541,49 +587,21 @@ def build_sector_leaders(
     if "stock_name" not in df.columns:
         df["stock_name"] = ""
 
-    # 量比（相對量）
     if "volume_ratio" not in df.columns:
         df["volume_ratio"] = 0.0
     df["volume_ratio"] = pd.to_numeric(df["volume_ratio"], errors="coerce").fillna(0.0)
 
-    # 漲跌幅：snapshot 多半有 change_rate；若沒有，日線用 spread/close 推
-    if "change_rate" not in df.columns or df["change_rate"].isna().all():
-        if "spread" in df.columns and "close" in df.columns:
-            close = pd.to_numeric(df["close"], errors="coerce")
-            spread = pd.to_numeric(df["spread"], errors="coerce")
-            prev_close = (close - spread).replace(0, np.nan)
-            df["change_rate"] = (spread / prev_close) * 100.0
-        else:
-            df["change_rate"] = 0.0
-    df["change_rate"] = pd.to_numeric(df["change_rate"], errors="coerce").fillna(0.0)
+    df = ensure_change_rate(df)
 
-    # 成交金額欄位（量大用成交金額更可靠）
-    money_col = None
-    for c in ["total_amount", "Trading_money", "amount", "Trading_amount"]:
-        if c in df.columns:
-            money_col = c
-            break
-    if money_col is None:
-        df["money"] = 0.0
-        money_col = "money"
+    money_col = pick_money_col(df)
     df[money_col] = pd.to_numeric(df[money_col], errors="coerce").fillna(0.0)
 
-    # 成交量欄位（顯示）
-    vol_col = None
-    for c in ["total_volume", "Trading_Volume", "volume"]:
-        if c in df.columns:
-            vol_col = c
-            break
-    if vol_col is None:
-        df["vol"] = 0.0
-        vol_col = "vol"
+    vol_col = pick_volume_col(df)
     df[vol_col] = pd.to_numeric(df[vol_col], errors="coerce").fillna(0.0)
 
-    # 避免冷門股：用成交金額做流動性門檻（保留較活躍者）
     q = df[money_col].quantile(0.30)
     df = df[df[money_col] >= q].copy()
 
-    # Top 族群（依資金流向）
     top_sector_names = (
         sector_flow.sort_values("signed_money", ascending=False)["industry_category"]
         .head(top_sectors)
@@ -600,7 +618,6 @@ def build_sector_leaders(
             if sub.empty:
                 continue
 
-        # 綜合分數：漲勢 60% + 量比 40%（同族群內）
         sub["score"] = (
             sub["change_rate"].rank(pct=True) * 0.6
             + sub["volume_ratio"].rank(pct=True) * 0.4
@@ -628,9 +645,140 @@ def build_sector_leaders(
 
 
 # -----------------------------
+# NEW: 第八分類（主題族群資金雷達）
+# -----------------------------
+def compute_theme_radar(
+    market_df: pd.DataFrame,
+    stock_info: pd.DataFrame,
+    theme_groups: dict,
+    top_k: int = 10,
+    money_threshold_yi: float = 1.0,
+) -> dict:
+    """
+    回傳：
+      - summary: 每主題資金/漲跌統計
+      - leaders: 每主題 Top 漲幅股（含門檻）
+    """
+    if market_df is None or market_df.empty:
+        return {"summary": pd.DataFrame(), "leaders": {}}
+
+    df = market_df.copy()
+    df["stock_id"] = df["stock_id"].astype(str)
+
+    # 補 stock_name/industry_category（若 market_df 沒有完整資訊）
+    if "stock_name" not in df.columns or "industry_category" not in df.columns:
+        info = stock_info[["stock_id", "stock_name", "industry_category"]].drop_duplicates()
+        info["stock_id"] = info["stock_id"].astype(str)
+        df = df.merge(info, on="stock_id", how="left")
+
+    df["stock_name"] = df.get("stock_name", "").fillna("")
+    df["industry_category"] = df.get("industry_category", "其他").fillna("其他")
+
+    df = ensure_change_rate(df)
+
+    money_col = pick_money_col(df)
+    vol_col = pick_volume_col(df)
+
+    df[money_col] = pd.to_numeric(df[money_col], errors="coerce").fillna(0.0)
+    df[vol_col] = pd.to_numeric(df[vol_col], errors="coerce").fillna(0.0)
+
+    # 資金偏多/偏空 proxy
+    df["signed_money"] = df[money_col] * np.sign(df["change_rate"].fillna(0.0))
+
+    summary_rows = []
+    leaders = {}
+
+    money_threshold = float(money_threshold_yi) * 1e8  # 億 -> 元(或金額單位對應 FinMind)
+    for theme, rule in theme_groups.items():
+        industry_list = rule.get("industry", []) or []
+        stock_list = [str(x) for x in (rule.get("stocks", []) or [])]
+
+        mask = pd.Series(False, index=df.index)
+        if industry_list:
+            mask = mask | df["industry_category"].isin(industry_list)
+        if stock_list:
+            mask = mask | df["stock_id"].isin(stock_list)
+
+        sub = df[mask].copy()
+        if sub.empty:
+            summary_rows.append(
+                {
+                    "主題": theme,
+                    "總成交金額(億)": 0.0,
+                    "資金偏多(億)": 0.0,
+                    "平均漲跌幅(%)": 0.0,
+                    "中位數漲跌幅(%)": 0.0,
+                    "上漲家數": 0,
+                    "下跌家數": 0,
+                    "平盤家數": 0,
+                }
+            )
+            leaders[theme] = pd.DataFrame()
+            continue
+
+        total_money_yi = sub[money_col].sum() / 1e8
+        signed_money_yi = sub["signed_money"].sum() / 1e8
+        avg_chg = float(sub["change_rate"].mean())
+        med_chg = float(sub["change_rate"].median())
+        up = int((sub["change_rate"] > 0).sum())
+        dn = int((sub["change_rate"] < 0).sum())
+        eq = int((sub["change_rate"] == 0).sum())
+
+        summary_rows.append(
+            {
+                "主題": theme,
+                "總成交金額(億)": round(total_money_yi, 2),
+                "資金偏多(億)": round(signed_money_yi, 2),
+                "平均漲跌幅(%)": round(avg_chg, 2),
+                "中位數漲跌幅(%)": round(med_chg, 2),
+                "上漲家數": up,
+                "下跌家數": dn,
+                "平盤家數": eq,
+            }
+        )
+
+        # Leaders：同時考慮成交金額門檻，避免冷門股干擾
+        pick = sub[sub[money_col] >= money_threshold].copy()
+        if pick.empty:
+            pick = sub.copy()
+
+        pick = pick.sort_values(["change_rate", money_col], ascending=[False, False]).head(top_k).copy()
+
+        show_cols = ["stock_id", "stock_name", "industry_category", "change_rate", money_col, vol_col]
+        if "volume_ratio" in pick.columns:
+            show_cols.append("volume_ratio")
+        if "close" in pick.columns:
+            show_cols.append("close")
+
+        pick = pick[show_cols].rename(
+            columns={
+                "industry_category": "產業",
+                "change_rate": "漲跌幅(%)",
+                money_col: "成交金額",
+                vol_col: "成交量",
+                "volume_ratio": "量比",
+                "close": "價格",
+            }
+        )
+        pick["成交金額(億)"] = pick["成交金額"] / 1e8
+        leaders[theme] = pick
+
+    summary = pd.DataFrame(summary_rows).sort_values("資金偏多(億)", ascending=False).reset_index(drop=True)
+    return {"summary": summary, "leaders": leaders}
+
+
+# -----------------------------
 # Main compute
 # -----------------------------
-def run_seven_features(token: str, stock_id: str, stock_info: pd.DataFrame, scan_mode: str, sector_pick_k: int) -> dict:
+def run_all_features(
+    token: str,
+    stock_id: str,
+    stock_info: pd.DataFrame,
+    scan_mode: str,
+    sector_pick_k: int,
+    theme_top_k: int,
+    theme_money_threshold_yi: float,
+) -> dict:
     res: dict = {"stock_id": stock_id, "scan_mode": scan_mode, "ts": datetime.utcnow().isoformat()}
 
     # 1) daily + realtime patch
@@ -695,15 +843,14 @@ def run_seven_features(token: str, stock_id: str, stock_info: pd.DataFrame, scan
         if dates:
             meta["source"] = "daily"
             meta["scan_date"] = dates[-1]
-            prev = dates[-2] if len(dates) >= 2 else None
-            sector_flow = compute_sector_flow_from_daily(token, stock_info, dates[-1], prev)
+            sector_flow = compute_sector_flow_from_daily(token, stock_info, dates[-1])
             vol_rank = compute_volume_ranking_from_daily(token, stock_info, dates)
 
     res["market_meta"] = meta
     res["sector_flow"] = sector_flow
     res["volume_rank"] = vol_rank
 
-    # NEW: 每族群量大 + 漲勢大代表股
+    # 十大族群代表股（你前面加的功能）
     res["sector_leaders"] = build_sector_leaders(
         vol_rank=vol_rank,
         sector_flow=sector_flow,
@@ -719,6 +866,15 @@ def run_seven_features(token: str, stock_id: str, stock_info: pd.DataFrame, scan
     # 7) revenue
     rev_start = (datetime.now(tz=TZ) - timedelta(days=365 * 6) if TZ else datetime.now() - timedelta(days=365 * 6)).strftime("%Y-%m-%d")
     res["revenue_raw"] = get_month_revenue_cached(token, stock_id, rev_start)
+
+    # 8) 主題族群資金雷達（用全市場 vol_rank 直接計算）
+    res["theme_radar"] = compute_theme_radar(
+        market_df=vol_rank,
+        stock_info=stock_info,
+        theme_groups=THEME_GROUPS,
+        top_k=theme_top_k,
+        money_threshold_yi=theme_money_threshold_yi,
+    )
 
     return res
 
@@ -737,8 +893,13 @@ scan_mode = st.sidebar.selectbox("全市場掃描來源", options=["即時快照
 top_n = st.sidebar.slider("相對大量榜 Top N", min_value=20, max_value=200, value=80, step=10)
 
 st.sidebar.divider()
-st.sidebar.subheader("族群代表股（量大 + 漲勢大）")
+st.sidebar.subheader("十大族群代表股")
 sector_pick_k = st.sidebar.slider("每族群挑幾檔", 3, 12, 5, 1)
+
+st.sidebar.divider()
+st.sidebar.subheader("第八分類：主題族群資金雷達")
+theme_top_k = st.sidebar.slider("每主題顯示個股數", 5, 30, 10, 1)
+theme_money_threshold_yi = st.sidebar.number_input("個股成交金額門檻（億）", min_value=0.0, value=1.0, step=0.5)
 
 if "result" not in st.session_state:
     st.session_state["result"] = None
@@ -746,29 +907,37 @@ if "result" not in st.session_state:
 with st.spinner("載入股票清單與產業分類..."):
     stock_info = get_stock_info_cached(token)
 
-if st.sidebar.button("一鍵更新七大功能"):
-    with st.spinner("更新中：即時補丁 / 全市場掃描 / 籌碼 / 營收..."):
-        st.session_state["result"] = run_seven_features(token, target_sid, stock_info, scan_mode, sector_pick_k)
+if st.sidebar.button("一鍵更新（含第八分類）"):
+    with st.spinner("更新中：即時補丁 / 全市場掃描 / 籌碼 / 營收 / 主題族群雷達..."):
+        st.session_state["result"] = run_all_features(
+            token=token,
+            stock_id=target_sid,
+            stock_info=stock_info,
+            scan_mode=scan_mode,
+            sector_pick_k=sector_pick_k,
+            theme_top_k=theme_top_k,
+            theme_money_threshold_yi=theme_money_threshold_yi,
+        )
     st.sidebar.success("更新完成")
 
 if st.sidebar.button("清除結果"):
     st.session_state["result"] = None
     st.sidebar.info("已清除")
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs(
-    ["1. 即時補丁 + 技術圖/評分", "2. 十大族群資金流向", "3. 全台股相對大量榜", "4. 籌碼照妖鏡", "5. 營收診斷"]
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+    ["1. 即時補丁 + 技術圖/評分", "2. 十大族群資金流向", "3. 全台股相對大量榜", "4. 籌碼照妖鏡", "5. 營收診斷", "8. 主題族群資金雷達"]
 )
 
 res = st.session_state.get("result")
 
 # ---------------------------------
-# 1) 12/30 即時補丁 + 三線技術圖 + 扣抵值 + 評分
+# 1) 即時補丁 + 技術圖 + 評分
 # ---------------------------------
 with tab1:
     st.subheader("即時股價補丁 + 三線技術圖 + 扣抵值 + 自動評分（0-100）")
 
     if res is None or res.get("stock_id") != target_sid:
-        st.info("請先按左側「一鍵更新七大功能」。")
+        st.info("請先按左側「一鍵更新（含第八分類）」。")
     else:
         t = res.get("price_df", pd.DataFrame())
         meta = res.get("patch_meta", {})
@@ -780,7 +949,6 @@ with tab1:
             patch_date = meta.get("patch_date", "")
             patched_flag = bool(meta.get("patched", False))
 
-            # 扣抵值
             kdr20 = float(t["close"].iloc[-20]) if len(t) >= 20 and pd.notna(t["close"].iloc[-20]) else np.nan
             kdr60 = float(t["close"].iloc[-60]) if len(t) >= 60 and pd.notna(t["close"].iloc[-60]) else np.nan
 
@@ -791,7 +959,7 @@ with tab1:
             c4.metric("MA60 扣抵值", "-" if pd.isna(kdr60) else f"{kdr60:.2f}")
 
             if patched_flag:
-                st.success(f"已套用 Pro 即時快照補丁：新增 {patch_date} 盤中資料列（解決日線日期卡住問題）。")
+                st.success(f"已套用 Pro 即時快照補丁：新增 {patch_date} 盤中資料列。")
             else:
                 st.caption("本次未新增補丁（日線已是最新日期或快照無資料）。")
 
@@ -802,11 +970,6 @@ with tab1:
             s4.metric("量能", f"{score.get('volume', 0):.0f} / 25")
             s5.metric("籌碼", f"{score.get('chip', 0):.0f} / 25")
 
-            notes = score.get("notes", [])
-            if notes:
-                st.caption("診斷摘要：" + "；".join(notes[:6]))
-
-            # 三線技術圖：Close + MA20(螢光黃) + MA60(桃紅) + 黃色 X
             fig = go.Figure()
             fig.add_trace(go.Scatter(x=t["date"], y=t["close"], name="Close", mode="lines"))
             fig.add_trace(go.Scatter(x=t["date"], y=t["MA20"], name="MA20", mode="lines", line=dict(color="#F7FF00", width=2)))
@@ -824,18 +987,19 @@ with tab1:
             st.plotly_chart(fig, use_container_width=True)
 
 # ---------------------------------
-# 2) 十大族群資金流向 + NEW: 每族群代表股
+# 2) 十大族群資金流向 + 族群代表股
 # ---------------------------------
 with tab2:
-    st.subheader("十大族群資金流向（全市場掃描，並抓出各族群：量大 + 漲勢大 代表股）")
+    st.subheader("十大族群資金流向 + 族群代表股（量大 + 漲勢大）")
 
     if res is None:
-        st.info("請先按左側「一鍵更新七大功能」。")
+        st.info("請先按左側「一鍵更新（含第八分類）」。")
     else:
         meta = res.get("market_meta", {})
         sector_flow = res.get("sector_flow", pd.DataFrame())
+
         if sector_flow is None or sector_flow.empty:
-            st.error("族群資金流向資料為空（可能：快照/日線掃描失敗）。")
+            st.error("族群資金流向資料為空。")
         else:
             st.caption(f"資料來源：{meta.get('source','')}；掃描日期：{meta.get('scan_date','')}")
             show = sector_flow.head(10).copy()
@@ -848,18 +1012,15 @@ with tab2:
             fig.update_layout(height=420, margin=dict(l=10, r=10, t=30, b=10), xaxis_title="族群", yaxis_title="資金流向(億)")
             st.plotly_chart(fig, use_container_width=True)
 
-        # NEW: 每族群量大 + 漲勢大代表股
         leaders = res.get("sector_leaders", {})
         if leaders:
-            st.markdown(f"### 各族群：當日量大 + 漲勢大 代表股（每族群 Top {sector_pick_k}）")
+            st.markdown(f"### 各族群：領漲放量 Top {sector_pick_k}")
             for sec, sdf in leaders.items():
-                with st.expander(f"{sec}｜領漲放量 Top {len(sdf)}", expanded=False):
+                with st.expander(f"{sec}｜Top {len(sdf)}", expanded=False):
                     df_show = sdf.copy()
                     if "成交金額" in df_show.columns:
                         df_show["成交金額(億)"] = df_show["成交金額"] / 1e8
                     st.dataframe(df_show, use_container_width=True)
-        else:
-            st.info("本次掃描未取得各族群領漲放量股（可能非交易時段或來源資料為空）。")
 
 # ---------------------------------
 # 3) 全台股相對大量榜
@@ -868,12 +1029,12 @@ with tab3:
     st.subheader("全台股相對大量榜（全市場量能增溫排行）")
 
     if res is None:
-        st.info("請先按左側「一鍵更新七大功能」。")
+        st.info("請先按左側「一鍵更新（含第八分類）」。")
     else:
         meta = res.get("market_meta", {})
         vol_rank = res.get("volume_rank", pd.DataFrame())
         if vol_rank is None or vol_rank.empty:
-            st.error("相對大量榜資料為空（可能：快照/日線掃描失敗）。")
+            st.error("相對大量榜資料為空。")
         else:
             st.caption(f"資料來源：{meta.get('source','')}；掃描日期：{meta.get('scan_date','')}")
             cols = ["stock_id", "stock_name", "industry_category", "volume_ratio"]
@@ -885,13 +1046,13 @@ with tab3:
             st.dataframe(top_df, use_container_width=True)
 
 # ---------------------------------
-# 4) 籌碼照妖鏡：法人買賣超 + 散戶融資
+# 4) 籌碼照妖鏡
 # ---------------------------------
 with tab4:
     st.subheader("籌碼照妖鏡（法人買賣超 + 散戶融資對照圖）")
 
     if res is None:
-        st.info("請先按左側「一鍵更新七大功能」。")
+        st.info("請先按左側「一鍵更新（含第八分類）」。")
     else:
         inst_df = res.get("inst_raw", pd.DataFrame())
         margin_df = res.get("margin_raw", pd.DataFrame())
@@ -929,25 +1090,14 @@ with tab4:
             fig.update_yaxes(title_text="融資餘額", secondary_y=True)
             st.plotly_chart(fig, use_container_width=True)
 
-        c1, c2 = st.columns(2)
-        with c1:
-            if inst_plot is not None and not inst_plot.empty:
-                st.metric("法人近5日合計(股)", f"{inst_plot.tail(5)['net'].sum():,.0f}")
-                st.dataframe(inst_plot.tail(10), use_container_width=True)
-        with c2:
-            if margin_plot is not None and not margin_plot.empty:
-                delta = margin_plot.tail(5)["margin_balance"].iloc[-1] - margin_plot.tail(5)["margin_balance"].iloc[0]
-                st.metric("近5日融資餘額變化", f"{delta:,.0f}")
-                st.dataframe(margin_plot.tail(10), use_container_width=True)
-
 # ---------------------------------
-# 5) 營收診斷：月營收年增率
+# 5) 營收診斷
 # ---------------------------------
 with tab5:
     st.subheader("營收診斷（月營收年增率圖表）")
 
     if res is None:
-        st.info("請先按左側「一鍵更新七大功能」。")
+        st.info("請先按左側「一鍵更新（含第八分類）」。")
     else:
         rev = res.get("revenue_raw", pd.DataFrame())
         if rev is None or rev.empty:
@@ -971,6 +1121,38 @@ with tab5:
             fig.update_layout(height=520, margin=dict(l=10, r=10, t=30, b=10), yaxis_title="年增率(%)")
             st.plotly_chart(fig, use_container_width=True)
 
-            show = rev[["date", "revenue", "yoy"]].tail(24).copy()
-            show["date"] = show["date"].dt.strftime("%Y-%m-%d")
-            st.dataframe(show, use_container_width=True)
+# ---------------------------------
+# 8) 主題族群資金雷達
+# ---------------------------------
+with tab6:
+    st.subheader("第八分類：主題族群資金雷達（資金狀況 + 當日族群個股漲幅）")
+
+    if res is None:
+        st.info("請先按左側「一鍵更新（含第八分類）」。")
+    else:
+        meta = res.get("market_meta", {})
+        radar = res.get("theme_radar", {"summary": pd.DataFrame(), "leaders": {}})
+        summary = radar.get("summary", pd.DataFrame())
+        leaders = radar.get("leaders", {})
+
+        st.caption(f"資料來源：{meta.get('source','')}；掃描日期：{meta.get('scan_date','')}")
+
+        if summary is None or summary.empty:
+            st.error("主題族群雷達資料為空（可能非交易時段或全市場掃描失敗）。")
+        else:
+            st.markdown("### 主題族群資金概況")
+            st.dataframe(summary, use_container_width=True)
+
+            fig = go.Figure()
+            fig.add_trace(go.Bar(x=summary["主題"], y=summary["資金偏多(億)"], name="資金偏多(億)"))
+            fig.update_layout(height=420, margin=dict(l=10, r=10, t=30, b=10), xaxis_title="主題", yaxis_title="資金偏多(億)")
+            st.plotly_chart(fig, use_container_width=True)
+
+            st.markdown(f"### 各主題：當日個股漲幅概況（Top {theme_top_k}；成交金額門檻 {theme_money_threshold_yi} 億）")
+            for theme in THEME_GROUPS.keys():
+                df_pick = leaders.get(theme, pd.DataFrame())
+                with st.expander(f"{theme}", expanded=False):
+                    if df_pick is None or df_pick.empty:
+                        st.info("本主題本次未抓到資料（可能名單未命中或資料源未含該股）。")
+                    else:
+                        st.dataframe(df_pick, use_container_width=True)
