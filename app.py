@@ -2253,7 +2253,7 @@ def run_all_features(
     res["volume_rank"] = vol_rank
 
     # sector strength & leaders
-    res["sector_strength"] = compute_sector_strength(vol_rank, sector_flow, top_n=10)
+    res["sector_strength"] = compute_sector_strength(vol_rank, sector_flow, top_n=60)
     res["sector_leaders"] = build_sector_leaders(vol_rank, sector_flow, top_sectors=10, k=sector_pick_k, only_up=True)
 
     # chip raw
@@ -2391,7 +2391,7 @@ if st.sidebar.button("清除結果"):
     st.sidebar.info("已清除")
 
 tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
-    ["1. 健診/技術圖", "2. 十大族群資金流向", "3. 營收診斷", "4. 主題族群雷達", "5. 交易計畫引擎", "6. 老王選股器"]
+    ["1. 健診/技術圖", "2. 資金流向儀錶板", "3. 營收診斷", "4. 主題族群雷達", "5. 交易計畫引擎", "6. 老王選股器"]
 )
 
 res = st.session_state.get("result")
@@ -2576,7 +2576,7 @@ with tab1:
 # Tab 2
 # -----------------------------
 with tab2:
-    st.subheader("十大族群資金流向 + 廣度/集中度 + 代表股")
+    st.subheader("資金流向儀錶板（熱力圖 + 族群強弱 + 代表股）")
     if res is None:
         st.info("請先按左側「一鍵更新（含交易計畫引擎）」。")
     else:
@@ -2603,6 +2603,80 @@ with tab2:
             st.info("本次無法計算族群廣度/集中度（資料不足）。")
         else:
             st.dataframe(strength, use_container_width=True)
+
+            # --- 市場總覽 KPI ---
+            vol_rank_all = res.get("volume_rank", pd.DataFrame())
+            if isinstance(vol_rank_all, pd.DataFrame) and not vol_rank_all.empty:
+                mkt = vol_rank_all.copy()
+                mkt["industry_category"] = mkt.get("industry_category", "其他").fillna("其他")
+                mkt = ensure_change_rate(mkt)
+                m_money_col = pick_money_col(mkt)
+                mkt[m_money_col] = pd.to_numeric(mkt[m_money_col], errors="coerce").fillna(0.0)
+
+                total_money_yi = float(mkt[m_money_col].sum() / 1e8)
+                signed_money_yi = float((mkt[m_money_col] * np.sign(mkt["change_rate"])).sum() / 1e8)
+                up_ratio = float((mkt["change_rate"] > 0).mean() * 100)
+
+                top10_share = np.nan
+                if "總成交金額(億)" in strength.columns and total_money_yi > 0:
+                    top10_share = float(strength.head(10)["總成交金額(億)"].sum() / total_money_yi * 100)
+
+                k1, k2, k3, k4 = st.columns(4)
+                k1.metric("全市場成交金額(億)", f"{total_money_yi:,.0f}")
+                k2.metric("全市場資金偏多(億)", f"{signed_money_yi:,.0f}")
+                k3.metric("上漲比例(%)", f"{up_ratio:.1f}%")
+                k4.metric("Top10 佔比(%)", "-" if pd.isna(top10_share) else f"{top10_share:.1f}%")
+
+            st.markdown("### 資金流向熱力圖（建議看『標準化』）")
+            heat_n = st.slider("熱力圖顯示族群數（依資金偏多排序）", min_value=10, max_value=60, value=30, step=5)
+            heat_mode = st.radio("熱力圖模式", ["標準化（相對強弱）", "原始值（絕對數字）"], horizontal=True)
+
+            heat_src = strength.head(int(heat_n)).copy()
+            cols = [c for c in ["資金偏多(億)", "總成交金額(億)", "上漲比例(%)", "領導集中度Top3(%)"] if c in heat_src.columns]
+            if cols:
+                heat_base = heat_src.set_index("族群")[cols].copy()
+                heat_base = heat_base.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+                if heat_mode.startswith("標準化"):
+                    # z-score by column
+                    z = (heat_base - heat_base.mean(axis=0)) / heat_base.std(axis=0, ddof=0).replace(0, np.nan)
+                    heat_z = z.replace([np.inf, -np.inf], 0.0).fillna(0.0)
+                    z_vals = heat_z.values
+                else:
+                    z_vals = heat_base.values
+
+                fig_h = go.Figure(
+                    data=go.Heatmap(
+                        z=z_vals,
+                        x=list(heat_base.columns),
+                        y=list(heat_base.index),
+                        customdata=heat_base.values,
+                        hovertemplate="族群: %{y}<br>%{x}: %{customdata:.2f}<extra></extra>",
+                    )
+                )
+                fig_h.update_layout(height=520, margin=dict(l=10, r=10, t=10, b=10))
+                st.plotly_chart(fig_h, use_container_width=True)
+            else:
+                st.info("熱力圖欄位不足（strength 表格缺少必要欄位）。")
+
+            st.markdown("### 族群雙榜（流入 / 流出）")
+            if isinstance(sector_flow, pd.DataFrame) and not sector_flow.empty:
+                flow = sector_flow.copy()
+                flow["資金流向(億)"] = flow["signed_money"] / 1e8
+                flow = flow.rename(columns={"industry_category": "族群"})
+
+                colA, colB = st.columns(2)
+                with colA:
+                    st.caption("強勢流入 Top 10")
+                    st.dataframe(flow.sort_values("signed_money", ascending=False).head(10)[["族群", "資金流向(億)"]], use_container_width=True)
+                with colB:
+                    st.caption("強勢流出 Top 10")
+                    st.dataframe(flow.sort_values("signed_money", ascending=True).head(10)[["族群", "資金流向(億)"]], use_container_width=True)
+
+                st.caption("輪動觀察（第 11–30 名）")
+                rot = flow.sort_values("signed_money", ascending=False).iloc[10:30][["族群", "資金流向(億)"]].copy()
+                st.dataframe(rot, use_container_width=True)
+
 
         leaders = res.get("sector_leaders", {})
         if leaders:
