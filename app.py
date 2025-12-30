@@ -995,6 +995,7 @@ def compute_oldwang_signals(stock_id: str, price_df: pd.DataFrame, profile: str)
     """
     out = {
         "ma5": np.nan, "ma10": np.nan, "ma20": np.nan, "ma60": np.nan,
+        "ma20_slope": np.nan, "ma20_turn_up": None, "hold_ma10_2d": None,
         "above_ma5": None, "above_ma10": None, "above_ma20": None, "above_ma60": None,
         "tri": False, "tri_strong": False, "four": False,
         "key_ma": 10, "key_hold": False, "key_break_2d": False,
@@ -1049,7 +1050,20 @@ def compute_oldwang_signals(stock_id: str, price_df: pd.DataFrame, profile: str)
     # 三陽開泰 / 四海遊龍
     if pd.notna(close) and all(pd.notna(x) for x in [ma5, ma10, ma20]):
         out["tri"] = (close >= ma5) and (close >= ma10) and (close >= ma20)
-        out["tri_strong"] = out["tri"] and (ma5 > ma10 > ma20)
+        # 強勢版額外條件：
+        # 1) MA20 走平翻揚（以近5日 MA20 斜率判斷）
+        if len(df) >= 25 and pd.notna(df["MA20"].iloc[-1]) and pd.notna(df["MA20"].iloc[-6]):
+            out["ma20_slope"] = float(df["MA20"].iloc[-1] - df["MA20"].iloc[-6])
+            out["ma20_turn_up"] = bool(out["ma20_slope"] >= 0)
+        # 2) 10MA 不破守線（連兩日收盤都在 10MA 之上）
+        if len(df) >= 2 and pd.notna(df["MA10"].iloc[-1]) and pd.notna(df["MA10"].iloc[-2]):
+            c1_ = float(df["close"].iloc[-1])
+            c2_ = float(df["close"].iloc[-2])
+            m1_ = float(df["MA10"].iloc[-1])
+            m2_ = float(df["MA10"].iloc[-2])
+            out["hold_ma10_2d"] = bool((c1_ >= m1_) and (c2_ >= m2_))
+        # 三陽開泰（強）：站上5/10/20 + 5>10>20，且（MA20翻揚 或 10MA連續守住）
+        out["tri_strong"] = bool(out["tri"] and (ma5 > ma10 > ma20) and ((out["ma20_turn_up"] is True) or (out["hold_ma10_2d"] is True)))
 
     if pd.notna(close) and all(pd.notna(x) for x in [ma5, ma10, ma20, ma60]):
         out["four"] = out["tri"] and (close >= ma60)
@@ -1115,7 +1129,7 @@ def compute_oldwang_signals(stock_id: str, price_df: pd.DataFrame, profile: str)
 
     # 訊號整理
     if out["tri_strong"]:
-        out["notes"].append("形態：三陽開泰（強勢版：5>10>20 且站上三均）")
+        out["notes"].append("形態：三陽開泰（強勢版：站上5/10/20 + 5>10>20，且MA20翻揚/10MA連續守住）")
     elif out["tri"]:
         out["notes"].append("形態：三陽開泰（站上5/10/20）")
     if out["four"]:
@@ -2332,7 +2346,6 @@ if not token:
 st.sidebar.header("參數")
 target_sid = st.sidebar.text_input("個股代碼", value="2330").strip()
 scan_mode = st.sidebar.selectbox("全市場掃描來源", options=["即時快照（推薦）", "日線（收盤資料）"], index=0)
-top_n = st.sidebar.slider("相對大量榜 Top N", min_value=20, max_value=200, value=80, step=10)
 
 st.sidebar.divider()
 st.sidebar.subheader("乖離率警報")
@@ -2377,8 +2390,8 @@ if st.sidebar.button("清除結果"):
     st.session_state["result"] = None
     st.sidebar.info("已清除")
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs(
-    ["1. 健診/技術圖", "2. 十大族群資金流向", "3. 全台股相對大量榜", "4. 籌碼照妖鏡", "5. 營收診斷", "8. 主題族群雷達", "9. 交易計畫引擎", "10. 老王選股器"]
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+    ["1. 健診/技術圖", "2. 十大族群資金流向", "3. 營收診斷", "4. 主題族群雷達", "5. 交易計畫引擎", "6. 老王選股器"]
 )
 
 res = st.session_state.get("result")
@@ -2487,6 +2500,8 @@ with tab1:
             sig_rows = [{
                 "三陽開泰": bool(ow.get("tri")),
                 "三陽開泰(強)": bool(ow.get("tri_strong")),
+                "MA20翻揚": ow.get("ma20_turn_up"),
+                "10MA連續守住": ow.get("hold_ma10_2d"),
                 "四海遊龍": bool(ow.get("four")),
                 "守10MA": bool(ow.get("key_hold")),
                 "連兩日破10MA": bool(ow.get("key_break_2d")),
@@ -2535,7 +2550,7 @@ with tab1:
                 fig.update_yaxes(title_text="融資餘額", secondary_y=True)
                 st.plotly_chart(fig, use_container_width=True)
             else:
-                st.caption("籌碼圖表資料不足（仍可到『籌碼照妖鏡』頁查看）。")
+                st.caption("籌碼圖表資料不足（請稍後重試或確認資料區間）。")
 
             # --- 技術圖（加上 5/10/20/60） ---
             st.markdown("### 技術圖（含 5/10/20/60）")
@@ -2603,72 +2618,6 @@ with tab2:
 # Tab 3
 # -----------------------------
 with tab3:
-    st.subheader("全台股相對大量榜（全市場量能增溫排行）")
-    if res is None:
-        st.info("請先按左側「一鍵更新（含交易計畫引擎）」。")
-    else:
-        meta = res.get("market_meta", {})
-        vol_rank = res.get("volume_rank", pd.DataFrame())
-        if vol_rank is None or vol_rank.empty:
-            st.error("相對大量榜資料為空。")
-        else:
-            st.caption(f"資料來源：{meta.get('source','')}；掃描日期：{meta.get('scan_date','')}")
-            cols = ["stock_id", "stock_name", "industry_category", "volume_ratio"]
-            for extra in ["close", "change_rate", "total_amount", "Trading_money", "Trading_Volume", "spread", "scan_date"]:
-                if extra in vol_rank.columns and extra not in cols:
-                    cols.append(extra)
-            top_df = vol_rank[cols].head(top_n).copy()
-            top_df.insert(0, "rank", range(1, len(top_df) + 1))
-            st.dataframe(top_df, use_container_width=True)
-
-# -----------------------------
-# Tab 4
-# -----------------------------
-with tab4:
-    st.subheader("籌碼照妖鏡（法人買賣超 + 散戶融資對照圖）")
-    if res is None:
-        st.info("請先按左側「一鍵更新（含交易計畫引擎）」。")
-    else:
-        inst_df = res.get("inst_raw", pd.DataFrame())
-        margin_df = res.get("margin_raw", pd.DataFrame())
-
-        inst_plot = None
-        if inst_df is not None and not inst_df.empty and {"date", "buy", "sell"}.issubset(inst_df.columns):
-            tmp = inst_df.copy()
-            tmp["buy"] = to_numeric_series(tmp["buy"]).fillna(0.0)
-            tmp["sell"] = to_numeric_series(tmp["sell"]).fillna(0.0)
-            tmp["net"] = tmp["buy"] - tmp["sell"]
-            inst_plot = tmp.groupby("date", as_index=False)["net"].sum().sort_values("date")
-
-        margin_plot = None
-        if margin_df is not None and not margin_df.empty and "date" in margin_df.columns:
-            m = margin_df.copy().sort_values("date")
-            bal_col = None
-            for cand in ["MarginPurchaseTodayBalance", "TodayBalance", "margin_purchase_today_balance"]:
-                if cand in m.columns:
-                    bal_col = cand
-                    break
-            if bal_col:
-                m[bal_col] = to_numeric_series(m[bal_col])
-                margin_plot = m[["date", bal_col]].rename(columns={bal_col: "margin_balance"})
-
-        if inst_plot is None and margin_plot is None:
-            st.error("法人/融資資料不足，無法繪圖。")
-        else:
-            fig = make_subplots(specs=[[{"secondary_y": True}]])
-            if inst_plot is not None:
-                fig.add_trace(go.Bar(x=inst_plot["date"], y=inst_plot["net"], name="法人買賣超(股)"), secondary_y=False)
-            if margin_plot is not None:
-                fig.add_trace(go.Scatter(x=margin_plot["date"], y=margin_plot["margin_balance"], mode="lines", name="融資餘額"), secondary_y=True)
-            fig.update_layout(height=520, margin=dict(l=10, r=10, t=30, b=10))
-            fig.update_yaxes(title_text="法人買賣超(股)", secondary_y=False)
-            fig.update_yaxes(title_text="融資餘額", secondary_y=True)
-            st.plotly_chart(fig, use_container_width=True)
-
-# -----------------------------
-# Tab 5
-# -----------------------------
-with tab5:
     st.subheader("營收診斷（月營收年增率圖表）")
     if res is None:
         st.info("請先按左側「一鍵更新（含交易計畫引擎）」。")
@@ -2696,9 +2645,9 @@ with tab5:
             st.plotly_chart(fig, use_container_width=True)
 
 # -----------------------------
-# Tab 6
+# Tab 4
 # -----------------------------
-with tab6:
+with tab4:
     st.subheader("第八分類：主題族群資金雷達（含廣度/集中度）")
     if res is None:
         st.info("請先按左側「一鍵更新（含交易計畫引擎）」。")
@@ -2729,9 +2678,9 @@ with tab6:
                         st.dataframe(df_pick, use_container_width=True)
 
 # -----------------------------
-# Tab 7
+# Tab 5
 # -----------------------------
-with tab7:
+with tab5:
     st.subheader("交易計畫引擎（型態分類 + 量價品質 + 可執行計畫）")
     if res is None:
         st.info("請先按左側「一鍵更新（含交易計畫引擎）」。")
@@ -2765,6 +2714,8 @@ with tab7:
             sig_rows = [{
                 "三陽開泰": ow.get("tri"),
                 "三陽開泰(強)": ow.get("tri_strong"),
+                "MA20翻揚": ow.get("ma20_turn_up"),
+                "10MA連續守住": ow.get("hold_ma10_2d"),
                 "四海遊龍": ow.get("four"),
                 "守住10MA": ow.get("key_hold"),
                 "連兩日破10MA": ow.get("key_break_2d"),
@@ -2812,9 +2763,9 @@ with tab7:
             n3.metric("目標2", "-" if t2 is None else f"{t2:.2f}")
 
 # -----------------------------
-# Tab 8
+# Tab 6
 # -----------------------------
-with tab8:
+with tab6:
     st.subheader("老王選股器（5/10/20/60 + 三陽開泰/四海遊龍 + 帶量突破 + 守10MA + 領導股）")
 
     if res is None:
