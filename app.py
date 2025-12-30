@@ -1515,6 +1515,60 @@ def get_multi_stock_price_cached(token: str, stock_ids: list[str], start_date: s
     df = pd.concat(frames, ignore_index=True)
     return normalize_date_col(df, "date")
 
+
+@st.cache_data(ttl=1800)
+def get_candidate_history_dailyall_cached(token: str, stock_ids: list[str], end_date: str, lookback: int = 80) -> pd.DataFrame:
+    """
+    以「每日全市場日線」拼出候選股歷史（避免逐檔抓取過慢/不穩）。
+    - 會抓 end_date 往前 lookback 個交易日（以 TaiwanStockTradingDate 為準）
+    - 每個交易日打一支 API（TaiwanStockPrice + start_date=該日），再過濾出 stock_ids
+    """
+    if not stock_ids:
+        return pd.DataFrame()
+
+    try:
+        tdf = get_trading_dates_cached(token)
+        if tdf is None or tdf.empty or "date" not in tdf.columns:
+            return pd.DataFrame()
+        tdf = tdf.sort_values("date")
+        dates = [d for d in tdf["date"].astype(str).tolist() if d <= str(end_date)]
+        dates = dates[-int(lookback):]
+    except Exception:
+        return pd.DataFrame()
+
+    stock_set = set([str(x) for x in stock_ids])
+
+    frames = []
+    for d in dates:
+        try:
+            day = get_daily_all_cached(token, d)
+            if day is None or day.empty or "stock_id" not in day.columns:
+                continue
+            day = day.copy()
+            day["stock_id"] = day["stock_id"].astype(str)
+            day = day[day["stock_id"].isin(stock_set)].copy()
+            if day.empty:
+                continue
+
+            keep = [c for c in ["stock_id", "date", "open", "max", "min", "close", "Trading_Volume", "Trading_money", "spread"] if c in day.columns]
+            day = day[keep].copy()
+            frames.append(day)
+        except Exception:
+            continue
+
+    if not frames:
+        return pd.DataFrame()
+
+    hist = pd.concat(frames, ignore_index=True)
+    hist = normalize_date_col(hist, "date")
+    hist["stock_id"] = hist["stock_id"].astype(str)
+
+    for c in ["close", "open", "max", "min", "Trading_Volume", "Trading_money", "spread"]:
+        if c in hist.columns:
+            hist[c] = pd.to_numeric(hist[c], errors="coerce")
+
+    return hist
+
 def oldwang_screener(
     token: str,
     stock_info: pd.DataFrame,
@@ -1527,55 +1581,74 @@ def oldwang_screener(
     min_money_yi: float = 1.0,
 ) -> pd.DataFrame:
     """
-    依據老王策略做選股：
-      - 5/10/20/月線（20MA）與 60MA
-      - 三陽開泰 / 四海遊龍
-      - 突破前高要帶量
-      - 大量後不能快速縮量（縮量警訊）
-      - 守10MA（避免被洗）
-      - 買強不買弱：族群領導股（以當日成交金額 Top3 代理）
+    依據老王策略做選股（全市場掃描）：
+      - 均線：MA5/MA10 判斷極短線；MA20（月線）判斷多頭；MA60 中期
+      - 形態：三陽開泰（站上 MA5/10/20）、四海遊龍（站上 MA5/10/20/60）
+      - 量價：突破前高壓力必須帶量（相對量門檻依股性）
+      - 量的延續：大量後不能快速縮量（縮量警訊）
+      - 一條線：守 10MA，不跌破就抱（連兩日跌破才視為失守，避免單一長黑洗盤）
+      - 買強不買弱：只做族群領導股（以當日成交金額 Top3 代理）
+      - 乖離率：過熱禁止追高（依大型/中小股容忍度）
     """
     if vol_rank_today is None or vol_rank_today.empty:
         return pd.DataFrame()
 
     df0 = vol_rank_today.copy()
+    if "stock_id" not in df0.columns:
+        return pd.DataFrame()
+
     df0["stock_id"] = df0["stock_id"].astype(str)
-    df0 = df0[df0["stock_id"].apply(_is_four_digit_stock_id)].copy()
-
-    # money col for liquidity gating
-    money_col = pick_money_col(df0)
-    df0[money_col] = pd.to_numeric(df0[money_col], errors="coerce").fillna(0.0)
-
-    # merge names if needed
-    if "stock_name" not in df0.columns or df0["stock_name"].isna().all():
-        info = stock_info[["stock_id", "stock_name", "industry_category"]].drop_duplicates()
-        info["stock_id"] = info["stock_id"].astype(str)
-        df0 = df0.merge(info, on="stock_id", how="left")
     df0["stock_name"] = df0.get("stock_name", "").fillna("")
     df0["industry_category"] = df0.get("industry_category", "其他").fillna("其他")
 
+    # As-of date
+    as_of_date = _now_date_str()
+    if "scan_date" in df0.columns and len(df0) and pd.notna(df0["scan_date"].iloc[0]):
+        as_of_date = str(df0["scan_date"].iloc[0])
+    elif "date" in df0.columns and len(df0) and pd.notna(df0["date"].iloc[0]):
+        try:
+            as_of_date = pd.to_datetime(df0["date"].iloc[0]).strftime("%Y-%m-%d")
+        except Exception:
+            as_of_date = _now_date_str()
+
+    # Ensure change_rate & volume_ratio exist
     df0 = ensure_change_rate(df0)
+    if "volume_ratio" not in df0.columns:
+        # fallback: approximate from volume / yesterday volume if exists, else 0
+        tv = pd.to_numeric(df0.get("total_volume", df0.get("Trading_Volume", 0)), errors="coerce")
+        yv = pd.to_numeric(df0.get("yesterday_volume", np.nan), errors="coerce")
+        df0["volume_ratio"] = tv / yv.replace(0, np.nan)
+    df0["volume_ratio"] = pd.to_numeric(df0["volume_ratio"], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    money_col = pick_money_col(df0)
+    df0[money_col] = pd.to_numeric(df0[money_col], errors="coerce").fillna(0.0)
 
     # liquidity gate
     min_money = float(min_money_yi) * 1e8
     df0 = df0[df0[money_col] >= min_money].copy()
+    if df0.empty:
+        return pd.DataFrame()
 
-    # Universe by liquidity
-    df0 = df0.sort_values(money_col, ascending=False).head(universe_top_n).copy()
+    # Universe by money
+    df0 = df0.sort_values(money_col, ascending=False).head(int(universe_top_n)).copy()
     candidate_ids = df0["stock_id"].tolist()
+    if not candidate_ids:
+        return pd.DataFrame()
 
-    # Leader flag by industry (Top3 by money)
+    # Leader flag (industry Top3 by money)
     df0["industry_rank_money"] = df0.groupby("industry_category")[money_col].rank(method="first", ascending=False)
     df0["is_leader"] = df0["industry_rank_money"] <= 3
 
-    # Fetch history for candidates
-    start_date = (datetime.now(tz=TZ) - timedelta(days=150) if TZ else datetime.now() - timedelta(days=150)).strftime("%Y-%m-%d")
-    hist = get_multi_stock_price_cached(token, candidate_ids, start_date)
+    # History for candidates (lookback trading days)
+    hist = get_candidate_history_dailyall_cached(token, candidate_ids, as_of_date, lookback=80)
     if hist is None or hist.empty:
-        return pd.DataFrame()
+        # last-resort fallback: per-stock (slower)
+        start_date = (datetime.now(tz=TZ) - timedelta(days=150) if TZ else datetime.now() - timedelta(days=150)).strftime("%Y-%m-%d")
+        hist = get_multi_stock_price_cached(token, candidate_ids, start_date)
+        if hist is None or hist.empty:
+            return pd.DataFrame()
 
     hist["stock_id"] = hist["stock_id"].astype(str)
-    hist = hist[hist["stock_id"].isin(candidate_ids)].copy()
     hist = normalize_date_col(hist, "date")
 
     # Ensure numeric columns
@@ -1583,62 +1656,87 @@ def oldwang_screener(
         if c in hist.columns:
             hist[c] = pd.to_numeric(hist[c], errors="coerce")
 
-    # Compute signals per stock
+    def _profile_for_sid(sid: str) -> str:
+        return classify_stock_profile(sid, stock_info)
+
+    def _vol_confirm_threshold(profile: str) -> float:
+        return 1.2 if profile == "大型權值股" else 1.5
+
+    def _bias_warn_threshold(profile: str) -> float:
+        return 6.0 if profile == "大型權值股" else 15.0
+
+    def _bias_danger_threshold(profile: str) -> float:
+        return 10.0 if profile == "大型權值股" else 20.0
+
     rows = []
-    for sid, g in hist.groupby("stock_id"):
-        g = g.sort_values("date")
-        if len(g) < 65 or g["close"].isna().all():
+    for sid in candidate_ids:
+        row0 = df0[df0["stock_id"] == sid]
+        if row0.empty:
+            continue
+        row0 = row0.iloc[0]
+
+        g = hist[hist["stock_id"] == sid].sort_values("date").copy()
+        if g.empty or "close" not in g.columns:
+            continue
+
+        # Patch to as_of_date with today's snapshot close if history not updated to as_of_date yet
+        last_hist_date = str(g["date"].iloc[-1]) if "date" in g.columns else ""
+        patched_intraday = False
+        if last_hist_date and last_hist_date < str(as_of_date):
+            today_close = pd.to_numeric(row0.get("close", np.nan), errors="coerce")
+            if pd.notna(today_close):
+                patched_intraday = True
+                today_open = pd.to_numeric(row0.get("open", today_close), errors="coerce")
+                today_high = pd.to_numeric(row0.get("high", row0.get("max", today_close)), errors="coerce")
+                today_low = pd.to_numeric(row0.get("low", row0.get("min", today_close)), errors="coerce")
+
+                today_vol = pd.to_numeric(row0.get("total_volume", row0.get("Trading_Volume", np.nan)), errors="coerce")
+                today_money = pd.to_numeric(row0.get("total_amount", row0.get("Trading_money", np.nan)), errors="coerce")
+
+                add = {"stock_id": sid, "date": str(as_of_date), "close": float(today_close)}
+                add["open"] = float(today_open) if pd.notna(today_open) else float(today_close)
+                add["max"] = float(today_high) if pd.notna(today_high) else float(today_close)
+                add["min"] = float(today_low) if pd.notna(today_low) else float(today_close)
+                if "Trading_Volume" in g.columns and pd.notna(today_vol):
+                    add["Trading_Volume"] = float(today_vol)
+                if "Trading_money" in g.columns and pd.notna(today_money):
+                    add["Trading_money"] = float(today_money)
+
+                g = pd.concat([g, pd.DataFrame([add])], ignore_index=True).sort_values("date")
+
+        # Need enough history
+        if len(g) < 60:
             continue
 
         close = float(g["close"].iloc[-1])
-        ma5 = float(g["close"].rolling(5).mean().iloc[-1])
-        ma10 = float(g["close"].rolling(10).mean().iloc[-1])
-        ma20 = float(g["close"].rolling(20).mean().iloc[-1])
-        ma60 = float(g["close"].rolling(60).mean().iloc[-1])
+        g["MA5"] = g["close"].rolling(5).mean()
+        g["MA10"] = g["close"].rolling(10).mean()
+        g["MA20"] = g["close"].rolling(20).mean()
+        g["MA60"] = g["close"].rolling(60).mean()
 
-        bias20 = (close / ma20 - 1) * 100 if pd.notna(ma20) and ma20 != 0 else np.nan
+        ma5 = float(g["MA5"].iloc[-1]) if pd.notna(g["MA5"].iloc[-1]) else np.nan
+        ma10 = float(g["MA10"].iloc[-1]) if pd.notna(g["MA10"].iloc[-1]) else np.nan
+        ma20 = float(g["MA20"].iloc[-1]) if pd.notna(g["MA20"].iloc[-1]) else np.nan
+        ma60 = float(g["MA60"].iloc[-1]) if pd.notna(g["MA60"].iloc[-1]) else np.nan
+
+        if pd.isna(ma20) or ma20 == 0:
+            continue
+
+        bias20 = (close / ma20 - 1) * 100
 
         # 三陽開泰 / 四海遊龍
         three = pd.notna(ma5) and pd.notna(ma10) and pd.notna(ma20) and close > ma5 and close > ma10 and close > ma20
         four = three and pd.notna(ma60) and close > ma60
 
-        # 突破20日前高（排除當日）
+        # Breakout: close > prev 20-day high (exclude today)
         high_col = "max" if "max" in g.columns else "close"
-        prev20_high = float(g[high_col].rolling(20).max().shift(1).iloc[-1])
-        breakout = pd.notna(prev20_high) and close > prev20_high
+        g[high_col] = pd.to_numeric(g[high_col], errors="coerce")
+        prev20_high = g[high_col].rolling(20).max().shift(1).iloc[-1]
+        breakout = pd.notna(prev20_high) and close > float(prev20_high)
 
-        # 相對量（今/近5日均量）
-        vol_ratio = np.nan
-        shrink_warn = False
-        if "Trading_Volume" in g.columns and g["Trading_Volume"].notna().sum() >= 10:
-            v = g["Trading_Volume"].copy()
-            v_now = v.iloc[-1]
-            v_base = v.iloc[-6:-1].mean()
-            if pd.notna(v_now) and pd.notna(v_base) and v_base > 0:
-                vol_ratio = float(v_now / v_base)
-
-            # 大量後快速縮量警訊：昨日放量 >= 1.5x 均量、今日 < 0.6*昨日
-            v_y = v.iloc[-2]
-            v_base_y = v.iloc[-7:-2].mean() if len(v) >= 7 else v.iloc[-6:-1].mean()
-            if pd.notna(v_y) and pd.notna(v_base_y) and v_base_y > 0:
-                if (v_y / v_base_y) >= 1.5 and pd.notna(v_now) and v_now < 0.6 * v_y:
-                    shrink_warn = True
-
-        # 守10MA（避免被洗）：連兩日跌破才算失守
-        hold10 = False
-        break10_two_days = False
-        if pd.notna(ma10):
-            if close >= ma10:
-                hold10 = True
-            if len(g) >= 2:
-                c1 = float(g["close"].iloc[-1])
-                c2 = float(g["close"].iloc[-2])
-                ma10_1 = float(g["close"].rolling(10).mean().iloc[-1])
-                ma10_2 = float(g["close"].rolling(10).mean().iloc[-2])
-                break10_two_days = (pd.notna(ma10_1) and pd.notna(ma10_2) and c1 < ma10_1 and c2 < ma10_2)
-
-        # Profile & thresholds
-        profile = _profile_for_sid(sid, stock_info)
+        # Volume conditions
+        vol_ratio = float(row0.get("volume_ratio", 0.0))
+        profile = _profile_for_sid(sid)
         vol_need = _vol_confirm_threshold(profile)
         bias_danger = _bias_danger_threshold(profile)
         bias_warn = _bias_warn_threshold(profile)
@@ -1653,92 +1751,140 @@ def oldwang_screener(
         vol_ok = (not pd.isna(vol_ratio)) and (vol_ratio >= vol_need)
         breakout_ok = breakout and vol_ok and (not forbid_chase)
 
-        # Today's info from df0
-        row0 = df0[df0["stock_id"] == sid]
-        if row0.empty:
-            continue
-        row0 = row0.iloc[0]
-        chg = float(row0.get("change_rate", 0.0))
-        money = float(row0.get(money_col, 0.0))
+        # 大量後不能快速縮量（用「完成日」避免盤中誤判）
+        shrink_warn = False
+        if "Trading_Volume" in g.columns:
+            v = pd.to_numeric(g["Trading_Volume"], errors="coerce").fillna(0.0)
+            # 若有盤中補丁，避免拿盤中量去判斷縮量：用「倒數第3天（大量）→倒數第2天（隔日）」檢查
+            if patched_intraday and len(v) >= 8:
+                v_surge = float(v.iloc[-3])
+                v_after = float(v.iloc[-2])
+                base = float(v.iloc[-8:-3].mean())
+                if base > 0 and (v_surge / base) >= 1.5 and v_after < 0.6 * v_surge:
+                    shrink_warn = True
+            elif (not patched_intraday) and len(v) >= 7:
+                v_surge = float(v.iloc[-2])
+                v_after = float(v.iloc[-1])
+                base = float(v.iloc[-7:-2].mean())
+                if base > 0 and (v_surge / base) >= 1.5 and v_after < 0.6 * v_surge:
+                    shrink_warn = True
+
+        # 守10MA（避免被洗）：連兩日跌破才算失守
+        hold10 = False
+        break10_two_days = False
+        if pd.notna(ma10) and ma10 != 0:
+            hold10 = close >= ma10
+            if len(g) >= 11 and pd.notna(g["MA10"].iloc[-2]):
+                below_today = float(g["close"].iloc[-1]) < float(g["MA10"].iloc[-1])
+                below_y = float(g["close"].iloc[-2]) < float(g["MA10"].iloc[-2])
+                break10_two_days = below_today and below_y
+
+        # Leader / industry / today stats
         leader = bool(row0.get("is_leader", False))
         industry = str(row0.get("industry_category", "其他") or "其他")
         name = str(row0.get("stock_name", "") or "")
+        chg = float(row0.get("change_rate", 0.0))
+        money = float(row0.get(money_col, 0.0))
 
-        # 老王核心：買強不買弱（需要領導股）
-        if require_leader and not leader:
-            pass_filter_leader = False
-        else:
-            pass_filter_leader = True
+        # Filters
+        pass_filter_leader = (not require_leader) or leader
 
-        # Pattern filter
-        pass_pattern = True
         if require_pattern == "三陽開泰":
-            pass_pattern = three
+            pass_filter_pattern = bool(three)
         elif require_pattern == "四海遊龍":
-            pass_pattern = four
+            pass_filter_pattern = bool(four)
+        else:
+            pass_filter_pattern = True
 
-        # Breakout filter
-        pass_breakout = True
-        if require_breakout:
-            pass_breakout = breakout_ok
+        pass_filter_breakout = (not require_breakout) or breakout_ok
 
-        if not (pass_filter_leader and pass_pattern and pass_breakout):
+        if not (pass_filter_leader and pass_filter_pattern and pass_filter_breakout):
             continue
 
-        # Vol quality label
-        vq = _simple_vol_quality(chg, vol_ratio) if not pd.isna(vol_ratio) else "N/A"
+        # 量價型態（快速標籤）
+        try:
+            vol_style = classify_volume_price(ensure_change_rate(g), vol_ratio).get("label", "一般")
+        except Exception:
+            vol_style = "一般"
 
-        # Score (老王偏好：領導 + 型態 + 帶量突破 + 守10MA；縮量/過熱扣分)
+        # 老王分數（規則化）
         s = 0
-        s += 20 if leader else 0
-        s += 25 if four else (15 if three else 0)
-        s += 25 if breakout_ok else (10 if breakout and vol_ok else 0)
-        s += 10 if hold10 else 0
-        s -= 12 if shrink_warn else 0
-        s -= 20 if forbid_chase else 0
-        s += 5 if vq == "放量上漲" else 0
-        s = int(max(0, min(100, s)))
-
         reasons = []
-        if leader: reasons.append("族群領導股")
-        if four: reasons.append("四海遊龍")
-        elif three: reasons.append("三陽開泰")
-        if breakout: reasons.append("突破前高")
-        if vol_ok: reasons.append("帶量")
-        if shrink_warn: reasons.append("縮量警訊")
-        if forbid_chase: reasons.append("乖離過大")
-        if break10_two_days: reasons.append("連兩日破10MA")
+
+        if leader:
+            s += 20
+            reasons.append("族群領導股")
+        else:
+            reasons.append("非領導股")
+
+        if four:
+            s += 25
+            reasons.append("四海遊龍")
+        elif three:
+            s += 18
+            reasons.append("三陽開泰")
+
+        if breakout_ok:
+            s += 22
+            reasons.append("突破前高且帶量")
+        elif breakout and vol_ok and forbid_chase:
+            s -= 15
+            reasons.append("突破但乖離過熱")
+        elif breakout and not vol_ok:
+            s += 8
+            reasons.append("突破但量能未確認")
+
+        if hold10:
+            s += 10
+            reasons.append("守10MA")
+        if break10_two_days:
+            s -= 10
+            reasons.append("連兩日破10MA")
+
+        if shrink_warn:
+            s -= 12
+            reasons.append("大量後快速縮量（反轉風險）")
+
+        if bias_state == "WARN":
+            s -= 8
+            reasons.append("乖離偏高")
+        elif bias_state == "DANGER":
+            s -= 30
+            reasons.append("乖離過熱（禁止追高）")
+
+        if chg > 0:
+            s += 3
+        if vol_ratio >= vol_need:
+            s += 3
+
+        # Clamp score
+        s = max(0, min(100, s))
 
         rows.append({
-            "代碼": sid,
-            "名稱": name,
-            "產業": industry,
+            "stock_id": sid,
+            "stock_name": name,
+            "industry_category": industry,
             "漲跌幅(%)": round(chg, 2),
             "成交金額(億)": round(money / 1e8, 2),
-            "相對量": round(vol_ratio, 2) if not pd.isna(vol_ratio) else np.nan,
-            "MA5": round(ma5, 2),
-            "MA10": round(ma10, 2),
-            "MA20": round(ma20, 2),
-            "MA60": round(ma60, 2),
-            "BIAS20(%)": round(bias20, 2) if not pd.isna(bias20) else np.nan,
+            "量比": round(vol_ratio, 2),
+            "BIAS20(%)": round(bias20, 2) if pd.notna(bias20) else np.nan,
+            "股性": profile,
             "三陽開泰": bool(three),
             "四海遊龍": bool(four),
-            "突破20前高": bool(breakout),
+            "突破": bool(breakout),
             "突破帶量": bool(breakout_ok),
             "守10MA": bool(hold10),
             "連兩日破10MA": bool(break10_two_days),
-            "領導股": bool(leader),
-            "量價品質": vq,
-            "Bias狀態": bias_state,
             "縮量警訊": bool(shrink_warn),
-            "老王分數": s,
-            "理由": " / ".join(reasons) if reasons else "",
+            "量價型態": vol_style,
+            "老王分數": int(s),
+            "理由": " / ".join(reasons),
         })
 
     if not rows:
         return pd.DataFrame()
 
-    out = pd.DataFrame(rows).sort_values(["老王分數", "成交金額(億)"], ascending=[False, False]).head(output_top_k).reset_index(drop=True)
+    out = pd.DataFrame(rows).sort_values(["老王分數", "成交金額(億)"], ascending=[False, False]).head(int(output_top_k)).reset_index(drop=True)
     out.insert(0, "Rank", range(1, len(out) + 1))
     return out
 
