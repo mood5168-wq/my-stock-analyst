@@ -2,4 +2,5 @@ streamlit
 pandas
 plotly
 FinMind>=1.6.1
+tqdm
 
