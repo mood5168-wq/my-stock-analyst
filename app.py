@@ -12,8 +12,8 @@ import streamlit as st
 # -----------------------------
 # Streamlit config
 # -----------------------------
-st.set_page_config(page_title="超級分析師-Pro（七大功能 + 第八分類 + 交易計畫引擎）", layout="wide")
-st.title("超級分析師-Pro（七大功能 + 第八分類 + 交易計畫引擎）")
+st.set_page_config(page_title="超級分析師-Pro", layout="wide")
+st.title("超級分析師-Pro
 
 # -----------------------------
 # Timezone
@@ -2627,7 +2627,70 @@ with tab2:
                 k3.metric("上漲比例(%)", f"{up_ratio:.1f}%")
                 k4.metric("Top10 佔比(%)", "-" if pd.isna(top10_share) else f"{top10_share:.1f}%")
 
-            st.markdown("### 資金流向熱力圖（建議看『標準化』）")
+            
+            # --- 方塊熱力圖（Treemap）---
+            st.markdown("### 方塊熱力圖（Treemap：大小=成交金額、顏色=族群漲跌）")
+            st.caption("更接近交易App的呈現方式：區塊大小代表成交金額，顏色代表族群當日強弱（加權平均漲跌幅）。")
+            tm_n = st.slider("Treemap 顯示族群數（依成交金額排序）", min_value=10, max_value=80, value=40, step=5)
+
+            if isinstance(vol_rank_all, pd.DataFrame) and not vol_rank_all.empty:
+                tm = vol_rank_all.copy()
+                tm["industry_category"] = tm.get("industry_category", "其他").fillna("其他")
+                tm = ensure_change_rate(tm)
+                tm_money_col = pick_money_col(tm)
+                tm[tm_money_col] = pd.to_numeric(tm[tm_money_col], errors="coerce").fillna(0.0)
+
+                # 加權平均漲跌幅（以成交金額加權）
+                def _wavg(g):
+                    money = g[tm_money_col].sum()
+                    if money <= 0:
+                        return 0.0
+                    return float((g["change_rate"] * g[tm_money_col]).sum() / money)
+
+                grp = tm.groupby("industry_category", as_index=False).apply(
+                    lambda g: pd.Series({
+                        "成交金額(億)": float(g[tm_money_col].sum() / 1e8),
+                        "加權漲跌幅(%)": _wavg(g),
+                        "上漲比例(%)": float((g["change_rate"] > 0).mean() * 100),
+                    })
+                ).reset_index(drop=True)
+
+                grp = grp.sort_values("成交金額(億)", ascending=False).head(int(tm_n)).copy()
+                grp["label"] = grp.apply(lambda r: f"{r['industry_category']}<br>{r['加權漲跌幅(%)']:+.2f}%", axis=1)
+
+                fig_tm = go.Figure(
+                    go.Treemap(
+                        labels=grp["label"],
+                        parents=[""] * len(grp),
+                        values=grp["成交金額(億)"],
+                        customdata=np.stack([grp["industry_category"], grp["成交金額(億)"], grp["加權漲跌幅(%)"], grp["上漲比例(%)"]], axis=1),
+                        marker=dict(
+                            colors=grp["加權漲跌幅(%)"],
+                            colorscale="RdYlGn",
+                            cmid=0,
+                            line=dict(width=1),
+                        ),
+                        hovertemplate=(
+                            "族群: %{customdata[0]}<br>"
+                            "成交金額(億): %{customdata[1]:.2f}<br>"
+                            "加權漲跌幅(%): %{customdata[2]:+.2f}<br>"
+                            "上漲比例(%): %{customdata[3]:.1f}<extra></extra>"
+                        ),
+                        textinfo="label",
+                    )
+                )
+                fig_tm.update_layout(
+                    height=620,
+                    margin=dict(l=10, r=10, t=10, b=10),
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    plot_bgcolor="rgba(0,0,0,0)",
+                )
+                st.plotly_chart(fig_tm, use_container_width=True)
+            else:
+                st.info("Treemap 需要全市場資料（volume_rank），目前資料不足。")
+
+
+            st.markdown("### 矩陣熱力圖（Heatmap：相對強弱矩陣）")
             heat_n = st.slider("熱力圖顯示族群數（依資金偏多排序）", min_value=10, max_value=60, value=30, step=5)
             heat_mode = st.radio("熱力圖模式", ["標準化（相對強弱）", "原始值（絕對數字）"], horizontal=True)
 
