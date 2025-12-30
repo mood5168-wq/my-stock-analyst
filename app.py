@@ -431,6 +431,181 @@ def compute_chip_score(inst_df: pd.DataFrame, margin_df: pd.DataFrame) -> tuple[
 # -----------------------------
 # 2 & 3) Market scan: sector flow + relative volume ranking
 # -----------------------------
+
+def compute_chip_summary(inst_df: pd.DataFrame, margin_df: pd.DataFrame, lookback_days: int = 20) -> dict:
+    """
+    籌碼摘要（給健診/持股判斷用）：
+      - 法人近1日/5日合計買賣超（並嘗試拆外資/投信/自營商）
+      - 融資餘額近5日變化
+      - 給出 signal：偏多/中性/偏空
+    注意：FinMind 欄位/名稱可能隨來源略有差異，因此做了容錯。
+    """
+    out = {
+        "signal": "中性",
+        "net_1d_total": None,
+        "net_5d_total": None,
+        "net_5d_foreign": None,
+        "net_5d_trust": None,
+        "net_5d_dealer": None,
+        "trust_streak": None,
+        "foreign_streak": None,
+        "margin_balance_col": None,
+        "margin_last": None,
+        "margin_delta_5d": None,
+        "inst_daily": pd.DataFrame(),    # columns: date, net_total, net_foreign, net_trust, net_dealer
+        "margin_daily": pd.DataFrame(),  # columns: date, margin_balance
+        "notes": [],
+    }
+
+    # -------- 法人 --------
+    if inst_df is not None and not inst_df.empty and {"date", "buy", "sell"}.issubset(inst_df.columns):
+        tmp = inst_df.copy()
+        tmp["buy"] = pd.to_numeric(tmp["buy"], errors="coerce").fillna(0.0)
+        tmp["sell"] = pd.to_numeric(tmp["sell"], errors="coerce").fillna(0.0)
+        tmp["net"] = tmp["buy"] - tmp["sell"]
+
+        # normalize date
+        try:
+            tmp["date"] = pd.to_datetime(tmp["date"]).dt.strftime("%Y-%m-%d")
+        except Exception:
+            tmp["date"] = tmp["date"].astype(str)
+
+        tmp = tmp.sort_values("date")
+
+        def map_inst_type(name: str) -> str:
+            n = str(name or "")
+            if "Investment_Trust" in n or "投信" in n:
+                return "投信"
+            if "Foreign" in n or "外資" in n:
+                return "外資"
+            if "Dealer" in n or "自營商" in n:
+                return "自營商"
+            return n
+
+        if "name" in tmp.columns:
+            tmp["inst_type"] = tmp["name"].map(map_inst_type)
+        else:
+            tmp["inst_type"] = "總計"
+
+        # daily totals (all types)
+        daily_total = tmp.groupby("date", as_index=False)["net"].sum().sort_values("date")
+        if not daily_total.empty:
+            out["net_1d_total"] = float(daily_total["net"].iloc[-1])
+            last5_dates = daily_total["date"].tail(5).tolist()
+            out["net_5d_total"] = float(daily_total[daily_total["date"].isin(last5_dates)]["net"].sum())
+
+            # build inst_daily for plotting (lookback_days)
+            inst_daily = daily_total.tail(lookback_days).rename(columns={"net": "net_total"}).copy()
+            out["inst_daily"] = inst_daily
+
+            # by type for last 5 days
+            last5 = tmp[tmp["date"].isin(last5_dates)].copy()
+            by_type = last5.groupby("inst_type")["net"].sum()
+
+            def _get_type_value(key: str):
+                v = by_type.get(key, np.nan)
+                return None if pd.isna(v) else float(v)
+
+            out["net_5d_foreign"] = _get_type_value("外資")
+            out["net_5d_trust"] = _get_type_value("投信")
+            out["net_5d_dealer"] = _get_type_value("自營商")
+
+            # trust/foreign streak (consecutive net>0 or <0) in last 10 days
+            def _streak(series: pd.Series) -> Optional[int]:
+                if series is None or series.empty:
+                    return None
+                s = series.dropna().astype(float)
+                if s.empty:
+                    return None
+                # streak of last sign
+                sign = 1 if s.iloc[-1] > 0 else (-1 if s.iloc[-1] < 0 else 0)
+                if sign == 0:
+                    return 0
+                cnt = 0
+                for x in reversed(s.tolist()):
+                    if (x > 0 and sign == 1) or (x < 0 and sign == -1):
+                        cnt += 1
+                    else:
+                        break
+                return cnt * sign  # positive means consecutive buy, negative means consecutive sell
+
+            # daily by type for streak calc
+            by_date_type = tmp.groupby(["date", "inst_type"], as_index=False)["net"].sum()
+            pivot = by_date_type.pivot(index="date", columns="inst_type", values="net").sort_index()
+            if "投信" in pivot.columns:
+                out["trust_streak"] = _streak(pivot["投信"].tail(10))
+            if "外資" in pivot.columns:
+                out["foreign_streak"] = _streak(pivot["外資"].tail(10))
+
+            # enrich inst_daily with type nets (optional)
+            if not out["inst_daily"].empty:
+                inst_daily = out["inst_daily"].set_index("date")
+                if "外資" in pivot.columns:
+                    inst_daily["net_foreign"] = pivot["外資"].reindex(inst_daily.index).fillna(0.0)
+                else:
+                    inst_daily["net_foreign"] = 0.0
+                if "投信" in pivot.columns:
+                    inst_daily["net_trust"] = pivot["投信"].reindex(inst_daily.index).fillna(0.0)
+                else:
+                    inst_daily["net_trust"] = 0.0
+                if "自營商" in pivot.columns:
+                    inst_daily["net_dealer"] = pivot["自營商"].reindex(inst_daily.index).fillna(0.0)
+                else:
+                    inst_daily["net_dealer"] = 0.0
+                out["inst_daily"] = inst_daily.reset_index()
+
+    # -------- 融資 --------
+    if margin_df is not None and not margin_df.empty and "date" in margin_df.columns:
+        m = margin_df.copy()
+        try:
+            m["date"] = pd.to_datetime(m["date"]).dt.strftime("%Y-%m-%d")
+        except Exception:
+            m["date"] = m["date"].astype(str)
+        m = m.sort_values("date")
+
+        bal_col = None
+        for cand in ["MarginPurchaseTodayBalance", "TodayBalance", "margin_purchase_today_balance"]:
+            if cand in m.columns:
+                bal_col = cand
+                break
+        if bal_col:
+            m[bal_col] = pd.to_numeric(m[bal_col], errors="coerce")
+            out["margin_balance_col"] = bal_col
+            margin_series = m[["date", bal_col]].dropna().rename(columns={bal_col: "margin_balance"}).copy()
+            out["margin_daily"] = margin_series.tail(lookback_days)
+
+            if not margin_series.empty:
+                out["margin_last"] = float(margin_series["margin_balance"].iloc[-1])
+                if len(margin_series) >= 6:
+                    out["margin_delta_5d"] = float(margin_series["margin_balance"].iloc[-1] - margin_series["margin_balance"].iloc[-6])
+                elif len(margin_series) >= 2:
+                    out["margin_delta_5d"] = float(margin_series["margin_balance"].iloc[-1] - margin_series["margin_balance"].iloc[0])
+
+    # -------- signal 判讀 --------
+    net5 = out.get("net_5d_total")
+    f5 = out.get("net_5d_foreign")
+    t5 = out.get("net_5d_trust")
+    m5 = out.get("margin_delta_5d")
+
+    bullish = (net5 is not None and net5 > 0) and ((f5 is not None and f5 > 0) or (t5 is not None and t5 > 0))
+    bearish = (net5 is not None and net5 < 0) and ((f5 is not None and f5 < 0) or (t5 is not None and t5 < 0))
+
+    # margin as confirmation: 融資增加偏風險、融資下降偏健康
+    if bullish and (m5 is None or m5 <= 0):
+        out["signal"] = "偏多"
+        out["notes"].append("籌碼偏多：法人近5日偏買超，且融資未明顯增加")
+    elif bearish and (m5 is None or m5 > 0):
+        out["signal"] = "偏空"
+        out["notes"].append("籌碼偏空：法人近5日偏賣超，且融資偏升溫")
+    else:
+        out["signal"] = "中性"
+        # keep note light to avoid noise
+        if net5 is not None:
+            out["notes"].append("籌碼中性：法人與融資未形成一致方向")
+
+    return out
+
+
 def compute_last_n_trading_dates(token: str, n: int = 6) -> list[str]:
     try:
         tdf = get_trading_dates_cached(token)
@@ -958,55 +1133,102 @@ def compose_oldwang_decision(
     bias_level: str,
     oldwang: dict,
     leader: dict,
+    chip_summary: dict,
     contrarian_flag: bool,
 ) -> dict:
     """
-    產出「持股判斷依據」與建議動作。
+    產出「持股判斷依據」與建議動作（老王策略 + 籌碼分析）。
     bias_level: ok/warn/buy/danger/na
     """
     action = "等待"
-    reasons = []
+    reasons: list[str] = []
 
+    # 反向警訊（手動）
     if contrarian_flag:
         reasons.append("反向警訊：市場/外資過度樂觀（手動標記），短線需防反轉")
 
+    # 籌碼摘要（寫入持股判斷依據）
+    chip = chip_summary or {}
+    chip_sig = chip.get("signal", "中性")
+
+    net5 = chip.get("net_5d_total")
+    f5 = chip.get("net_5d_foreign")
+    t5 = chip.get("net_5d_trust")
+    d5 = chip.get("net_5d_dealer")
+    m5 = chip.get("margin_delta_5d")
+
+    def fmt(v):
+        return "-" if v is None or pd.isna(v) else f"{float(v):,.0f}"
+
+    if chip_sig == "偏多":
+        reasons.append(f"籌碼偏多：法人5日 {fmt(net5)}；外資5日 {fmt(f5)}；投信5日 {fmt(t5)}；融資5日 {fmt(m5)}")
+    elif chip_sig == "偏空":
+        reasons.append(f"籌碼偏空：法人5日 {fmt(net5)}；外資5日 {fmt(f5)}；投信5日 {fmt(t5)}；融資5日 {fmt(m5)}")
+    else:
+        if any(v is not None for v in [net5, f5, t5, m5]):
+            reasons.append(f"籌碼中性：法人5日 {fmt(net5)}；外資5日 {fmt(f5)}；投信5日 {fmt(t5)}；融資5日 {fmt(m5)}")
+
+    # 買強不買弱（領導股）
     if not leader.get("is_leader", False):
         rank = leader.get("rank")
         reasons.append(f"買強不買弱：此股非族群Top3領導股（族群排名 {rank if rank else '-'}），優先關注領導股")
 
-    # 持股模式
+    # -------- 持股模式：續抱/加碼/減碼 --------
     if is_holding:
+        # 一條線策略：連兩日破10MA -> 續抱條件失效
         if oldwang.get("key_break_2d"):
             action = "減碼/出場"
             reasons.append("一條線策略失守：連兩日跌破10MA，續抱條件失效")
         else:
+            # 乖離過大：禁止追高（持股以不加碼為主）
             if bias_level == "danger":
                 action = "續抱但不加碼"
                 reasons.append("乖離過大：禁止追高；持股以移動停利/不加碼為主")
-            elif oldwang.get("tri") or oldwang.get("four"):
-                action = "續抱/可擇機加碼"
-                reasons.append("站上短均線結構成立，偏多續抱")
             else:
-                action = "續抱觀察"
-                reasons.append("尚未明確轉空，先守關鍵均線，等待型態明朗")
+                # 籌碼偏空且跌破20MA：偏轉弱
+                if chip_sig == "偏空" and (oldwang.get("above_ma20") is False):
+                    action = "減碼/出場"
+                    reasons.append("籌碼轉弱且跌破20MA：偏結構轉空，建議控風險")
+                # 型態成立 + 籌碼偏多：可續抱甚至加碼
+                elif (oldwang.get("four") or oldwang.get("tri_strong") or oldwang.get("tri")) and chip_sig == "偏多":
+                    action = "續抱/可擇機加碼"
+                    reasons.append("型態成立且籌碼偏多：符合買強續抱邏輯")
+                # 型態成立但籌碼未同步：續抱不加碼
+                elif (oldwang.get("four") or oldwang.get("tri_strong") or oldwang.get("tri")) and chip_sig != "偏多":
+                    action = "續抱但不加碼"
+                    reasons.append("型態成立但籌碼未同步：續抱觀察，不加碼")
+                else:
+                    action = "續抱觀察"
+                    reasons.append("尚未明確轉空：先守10MA/20MA，等待型態與籌碼明朗")
+
+    # -------- 非持股模式：是否進場 --------
     else:
-        # 非持股模式：決定是否可進
         if bias_level == "danger":
-            action = "不追價，等回測"
-            reasons.append("乖離過大：禁止追高；等待回測均線或整理後再評估")
+            action = "等待"
+            reasons.append("乖離過大：禁止追高，等回測/整理後再評估")
+        elif chip_sig == "偏空":
+            action = "等待"
+            reasons.append("籌碼偏空：不急著進，等法人回補/量價轉強")
         else:
-            if oldwang.get("breakout_need_volume") and any("量能未達" in x for x in oldwang.get("notes", [])):
-                action = "等待量能確認"
-                reasons.append("突破前高但量不足，先等放量確認再介入")
-            elif (oldwang.get("tri") or oldwang.get("four")) and leader.get("is_leader", False):
-                action = "可試單/分批"
-                reasons.append("買強不買弱：領導股 + 多頭型態成立，可試單並嚴守停損")
+            # 最佳：領導股 + 四海/三陽強勢 + 籌碼偏多
+            if leader.get("is_leader", False) and (oldwang.get("four") or oldwang.get("tri_strong")) and chip_sig == "偏多":
+                action = "可分批進場"
+                reasons.append("領導股 + 四海/三陽強勢 + 籌碼偏多：符合買強不買弱")
+            # 次佳：三陽/四海成立但條件未滿（等待拉回）
             elif oldwang.get("tri") or oldwang.get("four"):
-                action = "小部位試單"
-                reasons.append("多頭型態成立，但若非領導股，建議降低期待或換股")
+                action = "等待拉回"
+                reasons.append("型態成立但條件未滿：偏等回測10MA/20MA或帶量突破再進")
             else:
                 action = "等待"
-                reasons.append("型態未成形，等待三陽開泰/四海遊龍或回測承接點")
+                reasons.append("型態未成形：等待三陽開泰/四海遊龍或回測承接點")
+
+    # -------- 量價風險提醒（來自老王檢核）--------
+    if oldwang.get("breakout_need_volume"):
+        reasons.append("量價規則：突破前高需帶量；若無量不追")
+    if oldwang.get("post_surge_volume_ok") is False:
+        reasons.append("量價風險：大量後快速縮量，留意反轉")
+    if oldwang.get("washout_ignore"):
+        reasons.append("無視單一K棒：長黑但守住10MA，偏洗盤，勿因單日翻空")
 
     return {"action": action, "reasons": reasons}
 
@@ -1947,6 +2169,8 @@ def run_all_features(
             if c in patched.columns:
                 patched[c] = to_numeric_series(patched[c])
 
+        patched["MA5"] = patched["close"].rolling(5).mean()
+        patched["MA10"] = patched["close"].rolling(10).mean()
         patched["MA20"] = patched["close"].rolling(20).mean()
         patched["MA60"] = patched["close"].rolling(60).mean()
 
@@ -1973,6 +2197,12 @@ def run_all_features(
     score["chip"] = chip_score
     score["total"] = score["trend"] + score["momentum"] + score["volume"] + score["chip"]
     score["notes"].extend(chip_notes)
+
+    chip_summary = compute_chip_summary(inst_df, margin_df)
+    res["chip_summary"] = chip_summary
+    # keep notes light in score to avoid flooding
+    if (chip_summary or {}).get("notes"):
+        score["notes"].extend((chip_summary["notes"][:1]))
 
     ai = get_ai_advice(stock_id, stock_info, res["price_df"], score, bias_profile_mode)
     res["ai_advice"] = ai
@@ -2039,6 +2269,7 @@ def run_all_features(
         bias_level=(ai.get("bias_alert", {}) or {}).get("level", "na"),
         oldwang=oldwang,
         leader=leader,
+        chip_summary=chip_summary,
         contrarian_flag=contrarian_flag,
     )
 
@@ -2048,6 +2279,10 @@ def run_all_features(
     add_lines.append("——")
     add_lines.append("老王策略檢核（持股判斷依據）")
     add_lines.append(f"- 建議動作：**{decision['action']}**")
+    cs = chip_summary or {}
+    def _fmt(x):
+        return "-" if x is None or pd.isna(x) else f"{float(x):,.0f}"
+    add_lines.append(f"- 籌碼摘要：{cs.get('signal','-')}｜法人5日 {_fmt(cs.get('net_5d_total'))}｜外資5日 {_fmt(cs.get('net_5d_foreign'))}｜投信5日 {_fmt(cs.get('net_5d_trust'))}｜融資5日 {_fmt(cs.get('margin_delta_5d'))}")
     for r in decision["reasons"][:6]:
         add_lines.append(f"- {r}")
     # 顯示族群領導股清單（前3）
@@ -2152,88 +2387,164 @@ res = st.session_state.get("result")
 # Tab 1
 # -----------------------------
 with tab1:
-    st.subheader("健診：即時補丁 + 三線技術圖 + 乖離率 + 評分")
+    st.subheader("健診：老王策略 + 籌碼分析（5/10/20/60 + 三陽開泰/四海遊龍 + 法人/融資）")
     if res is None or res.get("stock_id") != target_sid:
-        st.info("請先按左側「一鍵更新（含交易計畫引擎）」。")
+        st.info("請先按左側「一鍵更新（含交易計畫引擎）」取得資料。")
     else:
         t = res.get("price_df", pd.DataFrame())
         meta = res.get("patch_meta", {})
         score = res.get("score", {})
         ai = res.get("ai_advice", {})
+        chip = res.get("chip_summary", {})
         te = res.get("trade_engine", {})
+
+        ow = te.get("oldwang", {}) if isinstance(te, dict) else {}
+        decision = te.get("decision", {}) if isinstance(te, dict) else {}
+        leader = te.get("leader", {}) if isinstance(te, dict) else {}
 
         if t is None or t.empty:
             st.error("日線資料為空。")
         else:
             patch_date = meta.get("patch_date", "")
             patched_flag = bool(meta.get("patched", False))
+            holding_mode = bool(st.session_state.get("is_holding", False))
 
-            kdr20 = float(t["close"].iloc[-20]) if len(t) >= 20 and pd.notna(t["close"].iloc[-20]) else np.nan
-            kdr60 = float(t["close"].iloc[-60]) if len(t) >= 60 and pd.notna(t["close"].iloc[-60]) else np.nan
+            # Ensure short MAs exist (for display/chart)
+            t = t.copy()
+            if "MA5" not in t.columns and "close" in t.columns:
+                t["MA5"] = pd.to_numeric(t["close"], errors="coerce").rolling(5).mean()
+            if "MA10" not in t.columns and "close" in t.columns:
+                t["MA10"] = pd.to_numeric(t["close"], errors="coerce").rolling(10).mean()
+            if "MA20" not in t.columns and "close" in t.columns:
+                t["MA20"] = pd.to_numeric(t["close"], errors="coerce").rolling(20).mean()
+            if "MA60" not in t.columns and "close" in t.columns:
+                t["MA60"] = pd.to_numeric(t["close"], errors="coerce").rolling(60).mean()
+
+            close = float(pd.to_numeric(t["close"].iloc[-1], errors="coerce"))
+            ma5 = ow.get("ma5", np.nan)
+            ma10 = ow.get("ma10", np.nan)
+            ma20 = ow.get("ma20", np.nan)
+            ma60 = ow.get("ma60", np.nan)
+
+            # fallback to df values if needed
+            if pd.isna(ma5) and pd.notna(t["MA5"].iloc[-1]): ma5 = float(t["MA5"].iloc[-1])
+            if pd.isna(ma10) and pd.notna(t["MA10"].iloc[-1]): ma10 = float(t["MA10"].iloc[-1])
+            if pd.isna(ma20) and pd.notna(t["MA20"].iloc[-1]): ma20 = float(t["MA20"].iloc[-1])
+            if pd.isna(ma60) and pd.notna(t["MA60"].iloc[-1]): ma60 = float(t["MA60"].iloc[-1])
 
             bias20 = float(t["BIAS20"].iloc[-1]) if "BIAS20" in t.columns and pd.notna(t["BIAS20"].iloc[-1]) else np.nan
             bias60 = float(t["BIAS60"].iloc[-1]) if "BIAS60" in t.columns and pd.notna(t["BIAS60"].iloc[-1]) else np.nan
+            vol_ratio = te.get("vol_ratio", None)
 
-            pattern = te.get("pattern", {}).get("pattern", "-")
-            vq = te.get("vol_quality", {}).get("label", "-")
+            # --- 結論（以老王決策 + 籌碼為主） ---
+            st.markdown("### 健診結論")
+            action = decision.get("action", "等待")
+            headline = f"模式：{'持股' if holding_mode else '觀察/找進場'}｜建議動作：{action}"
 
-            c1, c2, c3, c4, c5, c6 = st.columns(6)
-            c1.metric("最新價（含補丁）", f"{float(t['close'].iloc[-1]):.2f}")
-            c2.metric("資料日期", patch_date)
-            c3.metric("MA20 扣抵值", "-" if pd.isna(kdr20) else f"{kdr20:.2f}")
-            c4.metric("MA60 扣抵值", "-" if pd.isna(kdr60) else f"{kdr60:.2f}")
-            c5.metric("20MA 乖離率(%)", "-" if pd.isna(bias20) else f"{bias20:.2f}%")
-            c6.metric("60MA 乖離率(%)", "-" if pd.isna(bias60) else f"{bias60:.2f}%")
+            if ("出場" in action) or ("減碼" in action):
+                st.error(headline)
+            elif ("不加碼" in action) or ("觀察" in action) or ("等待" in action):
+                st.warning(headline)
+            else:
+                st.success(headline)
 
-            x1, x2 = st.columns(2)
-            x1.metric("型態", pattern)
-            x2.metric("量價品質", vq)
+            # 領導股提示
+            if leader.get("is_leader", False):
+                st.caption("買強不買弱：此股為族群Top3領導股（符合老王偏好）。")
+            else:
+                if leader.get("rank"):
+                    st.caption(f"買強不買弱：此股族群排名 {leader.get('rank')}（非Top3），優先關注領導股。")
+
+            # 建議依據（理由）
+            rs = decision.get("reasons", []) if isinstance(decision, dict) else []
+            if rs:
+                st.markdown("**持股判斷依據（老王策略 + 籌碼）**")
+                for r in rs[:10]:
+                    st.write(f"- {r}")
+
+            # --- 快速指標列（老王 + 籌碼重點） ---
+            st.markdown("### 快速指標")
+            n1, n2, n3, n4, n5, n6, n7, n8 = st.columns(8)
+            n1.metric("最新價", f"{close:.2f}")
+            n2.metric("資料日期", patch_date)
+            n3.metric("MA10（守線）", "-" if pd.isna(ma10) else f"{ma10:.2f}")
+            n4.metric("MA20", "-" if pd.isna(ma20) else f"{ma20:.2f}")
+            n5.metric("MA60", "-" if pd.isna(ma60) else f"{ma60:.2f}")
+            n6.metric("20MA乖離(%)", "-" if pd.isna(bias20) else f"{bias20:.2f}%")
+            n7.metric("法人5日合計", "-" if chip.get("net_5d_total") is None else f"{float(chip.get('net_5d_total')):,.0f}")
+            n8.metric("融資5日變化", "-" if chip.get("margin_delta_5d") is None else f"{float(chip.get('margin_delta_5d')):,.0f}")
+
+            if vol_ratio is not None and not pd.isna(vol_ratio):
+                st.caption(f"相對量（今/近5日均量）：{float(vol_ratio):.2f}")
 
             if patched_flag:
                 st.success(f"已套用 Pro 即時快照補丁：新增 {patch_date} 盤中資料列。")
             else:
                 st.caption("本次未新增補丁（日線已是最新日期或快照無資料）。")
 
-            # Bias alert
-            st.markdown("### 乖離率警報（地心引力 / 均值回歸）")
-            st.caption(f"股票屬性：{ai.get('profile','-')}（可在左側調整）")
-            alert = ai.get("bias_alert", {})
-            level = alert.get("level", "na")
+            # --- 老王策略檢核（結構化） ---
+            st.markdown("### 老王策略檢核（結構化）")
+            sig_rows = [{
+                "三陽開泰": bool(ow.get("tri")),
+                "三陽開泰(強)": bool(ow.get("tri_strong")),
+                "四海遊龍": bool(ow.get("four")),
+                "守10MA": bool(ow.get("key_hold")),
+                "連兩日破10MA": bool(ow.get("key_break_2d")),
+                "突破需帶量": bool(ow.get("breakout_need_volume")),
+                "大量後不縮量": ow.get("post_surge_volume_ok"),
+                "長黑洗盤提示": bool(ow.get("washout_ignore")),
+            }]
+            st.dataframe(pd.DataFrame(sig_rows), use_container_width=True)
 
-            if level == "danger":
-                st.error(alert.get("headline", ""))
-                if alert.get("detail"):
-                    st.text(alert["detail"])
-            elif level == "warn":
-                st.warning(alert.get("headline", ""))
-                if alert.get("detail"):
-                    st.text(alert["detail"])
-            elif level == "buy":
-                st.success(alert.get("headline", ""))
-                if alert.get("detail"):
-                    st.text(alert["detail"])
-            elif level == "ok":
-                st.info(alert.get("headline", ""))
-                if alert.get("detail"):
-                    st.text(alert["detail"])
+            ma_rows = [{
+                "收盤": close,
+                "MA5": ma5, "MA10": ma10, "MA20": ma20, "MA60": ma60,
+                "收盤>=MA5": ow.get("above_ma5"),
+                "收盤>=MA10": ow.get("above_ma10"),
+                "收盤>=MA20": ow.get("above_ma20"),
+                "收盤>=MA60": ow.get("above_ma60"),
+            }]
+            st.dataframe(pd.DataFrame(ma_rows), use_container_width=True)
+
+            # --- 籌碼分析（摘要 + 圖） ---
+            st.markdown("### 籌碼分析（法人 + 融資）")
+            csig = chip.get("signal", "中性")
+            c1, c2, c3, c4, c5, c6 = st.columns(6)
+            c1.metric("籌碼判讀", csig)
+            c2.metric("外資5日", "-" if chip.get("net_5d_foreign") is None else f"{float(chip.get('net_5d_foreign')):,.0f}")
+            c3.metric("投信5日", "-" if chip.get("net_5d_trust") is None else f"{float(chip.get('net_5d_trust')):,.0f}")
+            c4.metric("自營5日", "-" if chip.get("net_5d_dealer") is None else f"{float(chip.get('net_5d_dealer')):,.0f}")
+            c5.metric("法人5日合計", "-" if chip.get("net_5d_total") is None else f"{float(chip.get('net_5d_total')):,.0f}")
+            c6.metric("融資餘額", "-" if chip.get("margin_last") is None else f"{float(chip.get('margin_last')):,.0f}")
+
+            # 乖離警報 headline（簡化顯示）
+            alert = (ai.get("bias_alert", {}) or {})
+            if alert.get("level") in ["danger", "warn", "buy", "ok"]:
+                st.caption(f"乖離率提醒：{alert.get('headline','')}")
+
+            # Plot chip chart if available
+            inst_daily = chip.get("inst_daily", pd.DataFrame())
+            margin_daily = chip.get("margin_daily", pd.DataFrame())
+            if isinstance(inst_daily, pd.DataFrame) and not inst_daily.empty:
+                fig = make_subplots(specs=[[{"secondary_y": True}]])
+                fig.add_trace(go.Bar(x=inst_daily["date"], y=inst_daily.get("net_total", inst_daily.get("net", 0)), name="法人買賣超(合計)"), secondary_y=False)
+                if isinstance(margin_daily, pd.DataFrame) and (not margin_daily.empty) and "margin_balance" in margin_daily.columns:
+                    fig.add_trace(go.Scatter(x=margin_daily["date"], y=margin_daily["margin_balance"], mode="lines", name="融資餘額"), secondary_y=True)
+                fig.update_layout(height=420, margin=dict(l=10, r=10, t=30, b=10))
+                fig.update_yaxes(title_text="法人買賣超", secondary_y=False)
+                fig.update_yaxes(title_text="融資餘額", secondary_y=True)
+                st.plotly_chart(fig, use_container_width=True)
             else:
-                st.info("乖離率資料不足，無法觸發警報。")
+                st.caption("籌碼圖表資料不足（仍可到『籌碼照妖鏡』頁查看）。")
 
-            # Score
-            s1, s2, s3, s4, s5 = st.columns(5)
-            s1.metric("總分", f"{score.get('total', 0):.0f} / 100")
-            s2.metric("趨勢", f"{score.get('trend', 0):.0f} / 25")
-            s3.metric("動能", f"{score.get('momentum', 0):.0f} / 25")
-            s4.metric("量能", f"{score.get('volume', 0):.0f} / 25")
-            s5.metric("籌碼", f"{score.get('chip', 0):.0f} / 25")
-
-            notes = score.get("notes", [])
-            if notes:
-                st.caption("診斷摘要：" + "；".join([str(x) for x in notes[-6:]]))
-
-            # Three-line technical chart
+            # --- 技術圖（加上 5/10/20/60） ---
+            st.markdown("### 技術圖（含 5/10/20/60）")
             fig = go.Figure()
             fig.add_trace(go.Scatter(x=t["date"], y=t["close"], name="Close", mode="lines"))
+            if "MA5" in t.columns:
+                fig.add_trace(go.Scatter(x=t["date"], y=t["MA5"], name="MA5", mode="lines"))
+            if "MA10" in t.columns:
+                fig.add_trace(go.Scatter(x=t["date"], y=t["MA10"], name="MA10", mode="lines"))
             fig.add_trace(go.Scatter(x=t["date"], y=t["MA20"], name="MA20", mode="lines", line=dict(color="#F7FF00", width=2)))
             fig.add_trace(go.Scatter(x=t["date"], y=t["MA60"], name="MA60", mode="lines", line=dict(color="#FF2DA4", width=2)))
             fig.add_trace(go.Scatter(
