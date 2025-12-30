@@ -7,7 +7,7 @@ from FinMind.data import DataLoader
 import time
 
 # --- 1. 基礎設定 ---
-st.set_page_config(page_title="超級分析師-Pro終極穩定版", layout="wide")
+st.set_page_config(page_title="超級分析師-Pro終極版", layout="wide")
 
 # --- 2. 登入與 API 初始化 ---
 dl = DataLoader()
@@ -204,8 +204,15 @@ if login_ok:
             st.plotly_chart(fig, use_container_width=True)
 
         with tabs[1]:
-            if not c_df.empty: st.plotly_chart(px.bar(c_df[c_df['name'].isin(['Foreign_Investor','Investment_Trust'])], x='date', y='net_buy', color='name', barmode='group'), use_container_width=True)
-            if not m_df.empty: st.plotly_chart(px.line(m_df, x='date', y='MarginPurchaseStock', title="融資"), use_container_width=True)
+            # 籌碼圖
+            if not c_df.empty: 
+                st.plotly_chart(px.bar(c_df[c_df['name'].isin(['Foreign_Investor','Investment_Trust'])], x='date', y='net_buy', color='name', barmode='group', title="法人買賣超"), use_container_width=True)
+            
+            # 融資圖 (已修正欄位名稱: MarginPurchaseTodayBalance)
+            if not m_df.empty and 'MarginPurchaseTodayBalance' in m_df.columns:
+                st.plotly_chart(px.line(m_df, x='date', y='MarginPurchaseTodayBalance', title="融資餘額"), use_container_width=True)
+            elif not m_df.empty:
+                st.warning("查無融資餘額欄位，請確認資料來源。")
 
         with tabs[2]:
             if not r_df.empty: st.plotly_chart(px.bar(r_df, x='revenue_month', y='revenue', title="營收"), use_container_width=True)
