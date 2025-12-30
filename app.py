@@ -12,8 +12,8 @@ import streamlit as st
 # -----------------------------
 # Streamlit config
 # -----------------------------
-st.set_page_config(page_title="超級分析師-Pro（七大功能 + 第八分類）", layout="wide")
-st.title("超級分析師-Pro（七大功能 + 第八分類：主題族群資金雷達）")
+st.set_page_config(page_title="超級分析師-Pro（七大功能 + 第八分類 + 交易計畫引擎）", layout="wide")
+st.title("超級分析師-Pro（七大功能 + 第八分類 + 交易計畫引擎）")
 
 # -----------------------------
 # Timezone
@@ -25,49 +25,35 @@ except Exception:
     TZ = None  # fallback
 
 # -----------------------------
-# 乖離率警報：權值股名單（可自行增減）
+# Constants
 # -----------------------------
 LARGE_CAP_IDS = {
-    "2330",  # 台積電
-    "2454",  # 聯發科
-    "2317",  # 鴻海
-    "2308",  # 台達電
-    "2412",  # 中華電
-    "3711",  # 日月光投控
-    "2382",  # 廣達
-    "2357",  # 華碩
-    "3008",  # 大立光
-    "2002",  # 中鋼
-    "1301", "1303",  # 台塑/南亞
-    # 主要金控（金融股波動通常較低，乖離容忍度也偏低）
+    "2330", "2454", "2317", "2308", "2412", "3711", "2382", "2357", "3008",
+    "2002", "1301", "1303",
     "2881", "2882", "2891", "2886", "2884", "2885", "2880", "2887", "2892",
 }
 
-# -----------------------------
-# 第八分類：主題族群定義（可自行調整名單）
-# -----------------------------
 THEME_GROUPS = {
-    # 以產業分類抓
     "半導體族群": {"industry": ["半導體業"], "stocks": []},
-    "金融族群": {"industry": ["金融保險業"], "stocks": ["2881","2882","2891","2886","2884","2885","2880","2887","2892"]},
-
-    # 以成分股抓（可自行增減）
     "記憶體族群": {"industry": [], "stocks": ["2408","2344","2337","3260","8299","3006","4967"]},
     "PCB族群": {"industry": [], "stocks": ["3037","8046","2313","2368","4958","2383","6213","3189","6274"]},
     "CPO族群": {"industry": [], "stocks": ["4979","3081","3163","3363","4909","3450","2345"]},
     "航運族群": {"industry": [], "stocks": ["2603","2609","2615","2606","2605","2637","2617","5608","2641"]},
     "伺服器族群": {"industry": [], "stocks": ["2382","3231","6669","2356","2317","2324","3706","2376","4938"]},
     "散熱族群": {"industry": [], "stocks": ["3017","3324","3653","2421","3338","6230"]},
+    "金融族群": {"industry": ["金融保險業"], "stocks": ["2881","2882","2891","2886","2884","2885","2880","2887","2892"]},
     "電力重電": {"industry": [], "stocks": ["1519","1513","1503","1504","1514","1609","1617"]},
 }
 
 # -----------------------------
-# FinMind REST helpers
+# FinMind REST endpoints
 # -----------------------------
 FINMIND_DATA_URL = "https://api.finmindtrade.com/api/v4/data"
 FINMIND_TICK_SNAPSHOT_URL = "https://api.finmindtrade.com/api/v4/taiwan_stock_tick_snapshot"
 
-
+# -----------------------------
+# Helpers
+# -----------------------------
 def _now_date_str() -> str:
     if TZ:
         return datetime.now(tz=TZ).strftime("%Y-%m-%d")
@@ -129,9 +115,6 @@ def finmind_tick_snapshot(
     return pd.DataFrame(payload.get("data", []))
 
 
-# -----------------------------
-# Utilities
-# -----------------------------
 def normalize_date_col(df: pd.DataFrame, col: str = "date") -> pd.DataFrame:
     if df is None or df.empty or col not in df.columns:
         return df
@@ -155,9 +138,9 @@ def safe_div(a, b, default=np.nan):
 
 def ensure_change_rate(df: pd.DataFrame) -> pd.DataFrame:
     """
-    保證 df 有 change_rate（%）
-    - snapshot 通常直接有 change_rate
-    - 日線用 spread/close 推回
+    Ensure change_rate exists (%).
+    - snapshot typically has change_rate
+    - daily: compute via spread / prev_close
     """
     if df is None or df.empty:
         return df
@@ -195,165 +178,11 @@ def pick_volume_col(df: pd.DataFrame) -> str:
     return "vol"
 
 
-# -----------------------------
-# 乖離率警報（你的邏輯）+ AI advice
-# -----------------------------
-def classify_stock_profile(stock_id: str, stock_info: pd.DataFrame) -> str:
-    """
-    回傳：'大型權值股' or '中小型飆股'
-    - 若在 LARGE_CAP_IDS -> 大型權值
-    - 若產業為金融保險業 -> 大型權值
-    - 其他 -> 中小型飆股
-    """
-    sid = str(stock_id).strip()
-    if sid in LARGE_CAP_IDS:
-        return "大型權值股"
-    try:
-        row = stock_info[stock_info["stock_id"].astype(str) == sid]
-        if not row.empty:
-            ind = str(row.iloc[-1].get("industry_category", "") or "")
-            if ind == "金融保險業":
-                return "大型權值股"
-    except Exception:
-        pass
-    return "中小型飆股"
-
-
-def get_bias_alert(bias20: float, bias60: float, profile: str) -> dict:
-    """
-    依據你提供的「地心引力/均值回歸」尺度，輸出乖離率警報。
-    profile: '大型權值股' or '中小型飆股'
-    level: 'danger'|'warn'|'buy'|'ok'|'na'
-    """
-    out = {"level": "na", "headline": "乖離率資料不足", "detail": "", "thresholds": {}}
-    if bias20 is None or pd.isna(bias20):
-        return out
-
-    b20 = float(bias20)
-    b60 = float(bias60) if (bias60 is not None and not pd.isna(bias60)) else np.nan
-
-    endings = (
-        "乖離過大常見三種結局：\n"
-        "1) 直接崩跌：股價快速下跌去找均線。\n"
-        "2) 橫盤整理：以盤代跌，等均線慢慢上來。\n"
-        "3) 假突破真拉回：再創高一下後急殺。"
-    )
-
-    if profile == "大型權值股":
-        out["thresholds"] = {"warn_hi": 10.0, "warn_lo": -10.0}
-
-        if b20 >= 10.0:
-            out["level"] = "danger"
-            out["headline"] = f"❌ 乖離過大，禁止追高（20MA乖離 {b20:.2f}% ≥ +10%）"
-            out["detail"] = (
-                "大型權值股推動不易，+10% 以上常落在波段高檔區。\n"
-                "操作建議：不追價；若已有獲利，偏向分批調節/降低槓桿。\n\n" + endings
-            )
-        elif b20 <= -10.0:
-            out["level"] = "buy"
-            out["headline"] = f"✅ 超賣區（20MA乖離 {b20:.2f}% ≤ -10%）"
-            out["detail"] = (
-                "大型權值股跌破 20MA -10% 常見於恐慌/超賣段。\n"
-                "操作建議：可留意分批布局，但仍以『止跌/轉強訊號』做確認；嚴守停損。"
-            )
-        elif b20 >= 6.0:
-            out["level"] = "warn"
-            out["headline"] = f"⚠️ 乖離偏高（20MA乖離 {b20:.2f}%）"
-            out["detail"] = (
-                "距離 +10% 警戒線不遠，風險報酬比開始下降。\n"
-                "操作建議：避免追高；偏向等回測20MA或量縮整理後再評估。"
-            )
-        else:
-            out["level"] = "ok"
-            out["headline"] = f"乖離在合理區間（20MA乖離 {b20:.2f}%）"
-            out["detail"] = "乖離未達警戒，仍需搭配趨勢/量能/籌碼做整體判讀。"
-    else:
-        out["thresholds"] = {"warn_hi": 15.0, "danger_hi": 20.0, "mania": 30.0, "warn_lo": -12.0}
-
-        if b20 >= 30.0:
-            out["level"] = "danger"
-            out["headline"] = f"❌ 瘋狂區：禁止追高（20MA乖離 {b20:.2f}% ≥ +30%）"
-            out["detail"] = (
-                "通常屬末升段噴出，風險報酬比極差。\n"
-                "操作建議：不建議追價進場；若持有，偏向分批落袋/移動停利。\n\n" + endings
-            )
-        elif b20 >= 20.0:
-            out["level"] = "danger"
-            out["headline"] = f"❌ 高風險區：禁止追高（20MA乖離 {b20:.2f}% ≥ +20%）"
-            out["detail"] = (
-                "+20% 區域隨時可能出現長黑修正。\n"
-                "操作建議：不追價；若持有，偏向移動停利/分批落袋。\n\n" + endings
-            )
-        elif b20 >= 15.0:
-            out["level"] = "warn"
-            out["headline"] = f"⚠️ 警戒區：風險報酬比差（20MA乖離 {b20:.2f}% ≥ +15%）"
-            out["detail"] = (
-                "飆股可長時間無視地心引力，但 +15% 後勝率與RR開始變差。\n"
-                "操作建議：寧可錯過，不可做錯；等回測/整理後再找點。"
-            )
-        elif b20 <= -12.0:
-            out["level"] = "buy"
-            out["headline"] = f"✅ 偏超賣（20MA乖離 {b20:.2f}% ≤ -12%）"
-            out["detail"] = (
-                "中小型股超賣後反彈彈性大，但也更容易跌深續跌。\n"
-                "操作建議：只做『分批試單 + 嚴格停損』，並以轉強訊號確認。"
-            )
-        else:
-            out["level"] = "ok"
-            out["headline"] = f"乖離在合理區間（20MA乖離 {b20:.2f}%）"
-            out["detail"] = "可搭配趨勢/量能/題材強度做整體評估。"
-
-    # 60MA 乖離補充提示（中期過熱/過冷）
-    if pd.notna(b60) and abs(b60) >= 25 and out["level"] in ["ok", "warn", "buy"]:
-        out["detail"] += f"\n\n補充：60MA 乖離 {b60:.2f}% 已偏極端（中期過熱/過冷），請提高風險控管。"
-
-    return out
-
-
-def get_ai_advice(
-    stock_id: str,
-    stock_info: pd.DataFrame,
-    price_df: pd.DataFrame,
-    score: dict,
-    bias_profile_mode: str,
-) -> dict:
-    """
-    你的 Python 分析師：把乖離率警報寫進診斷邏輯，並回傳可直接顯示的結論。
-    """
-    # 決定股票屬性
-    if bias_profile_mode == "大型權值股":
-        profile = "大型權值股"
-    elif bias_profile_mode == "中小型飆股":
-        profile = "中小型飆股"
-    else:
-        profile = classify_stock_profile(stock_id, stock_info)
-
-    # 取最後一筆乖離
-    b20 = np.nan
-    b60 = np.nan
-    if price_df is not None and not price_df.empty:
-        if "BIAS20" in price_df.columns:
-            b20 = float(price_df["BIAS20"].iloc[-1])
-        if "BIAS60" in price_df.columns:
-            b60 = float(price_df["BIAS60"].iloc[-1])
-
-    bias_alert = get_bias_alert(b20, b60, profile)
-
-    # 用 score 做補充（不取代乖離警報）
-    total = float(score.get("total", 0)) if isinstance(score, dict) else 0.0
-    stance = "中性"
-    if total >= 75:
-        stance = "偏多"
-    elif total <= 45:
-        stance = "偏空"
-
-    return {
-        "profile": profile,
-        "bias20": b20,
-        "bias60": b60,
-        "bias_alert": bias_alert,
-        "stance": stance,
-    }
+def _get_col(df: pd.DataFrame, candidates: list[str]) -> Optional[str]:
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
 
 
 # -----------------------------
@@ -383,6 +212,12 @@ def get_daily_one_cached(token: str, stock_id: str, start_date: str, end_date: O
 @st.cache_data(ttl=3600)
 def get_trading_dates_cached(token: str) -> pd.DataFrame:
     df = finmind_get_data(token, dataset="TaiwanStockTradingDate", timeout=40)
+    return normalize_date_col(df, "date")
+
+
+@st.cache_data(ttl=6 * 3600)
+def get_daily_all_cached(token: str, date_str: str) -> pd.DataFrame:
+    df = finmind_get_data(token, dataset="TaiwanStockPrice", start_date=date_str, timeout=60)
     return normalize_date_col(df, "date")
 
 
@@ -418,20 +253,15 @@ def get_month_revenue_cached(token: str, stock_id: str, start_date: str) -> pd.D
     return normalize_date_col(df, "date")
 
 
-@st.cache_data(ttl=6 * 3600)
-def get_daily_all_cached(token: str, date_str: str) -> pd.DataFrame:
-    df = finmind_get_data(token, dataset="TaiwanStockPrice", start_date=date_str, timeout=60)
-    return normalize_date_col(df, "date")
-
-
 # -----------------------------
-# 12/30 realtime patch
+# 1) Pro snapshot patch to force today's row
 # -----------------------------
 def patch_daily_with_snapshot(daily_df: pd.DataFrame, snap_row: pd.Series) -> tuple[pd.DataFrame, bool, str]:
     if daily_df is None or daily_df.empty:
         return daily_df, False, ""
 
     daily_df = normalize_date_col(daily_df.copy(), "date")
+
     snap_dt = pd.to_datetime(snap_row.get("date"))
     snap_date = snap_dt.strftime("%Y-%m-%d") if not pd.isna(snap_dt) else _now_date_str()
 
@@ -442,7 +272,8 @@ def patch_daily_with_snapshot(daily_df: pd.DataFrame, snap_row: pd.Series) -> tu
     new_row = {c: np.nan for c in daily_df.columns}
     new_row["date"] = snap_date
 
-    for k_from, k_to in [
+    # Snapshot -> TaiwanStockPrice mapping
+    mapping = [
         ("open", "open"),
         ("high", "max"),
         ("low", "min"),
@@ -450,7 +281,8 @@ def patch_daily_with_snapshot(daily_df: pd.DataFrame, snap_row: pd.Series) -> tu
         ("total_volume", "Trading_Volume"),
         ("total_amount", "Trading_money"),
         ("change_price", "spread"),
-    ]:
+    ]
+    for k_from, k_to in mapping:
         if k_to in new_row and k_from in snap_row.index:
             new_row[k_to] = snap_row.get(k_from)
 
@@ -459,7 +291,7 @@ def patch_daily_with_snapshot(daily_df: pd.DataFrame, snap_row: pd.Series) -> tu
 
 
 # -----------------------------
-# Score system (0-100): 4 dimensions
+# 4) Score system (0-100): 4 dimensions
 # -----------------------------
 def compute_score(t: pd.DataFrame) -> dict:
     out = {"trend": 0.0, "momentum": 0.0, "volume": 0.0, "chip": 0.0, "total": 0.0, "notes": []}
@@ -471,6 +303,7 @@ def compute_score(t: pd.DataFrame) -> dict:
     df["close"] = to_numeric_series(df["close"])
     if "Trading_Volume" in df.columns:
         df["Trading_Volume"] = to_numeric_series(df["Trading_Volume"])
+
     df["MA20"] = df["close"].rolling(20).mean()
     df["MA60"] = df["close"].rolling(60).mean()
 
@@ -498,7 +331,7 @@ def compute_score(t: pd.DataFrame) -> dict:
                 trend = min(25, trend + 2)
     out["trend"] = float(trend)
 
-    # Momentum (0-25)
+    # Momentum (0-25): 10-day return
     momentum = 0
     if len(df) >= 11 and pd.notna(df["close"].iloc[-11]) and pd.notna(c):
         r10 = c / float(df["close"].iloc[-11]) - 1.0
@@ -514,13 +347,15 @@ def compute_score(t: pd.DataFrame) -> dict:
             momentum = 5
         else:
             momentum = 0
+
+        # over-extended vs MA20 penalty
         if pd.notna(ma20) and ma20 > 0:
             dist = abs(c / ma20 - 1.0)
             if dist > 0.12:
                 momentum = max(0, momentum - 5)
     out["momentum"] = float(momentum)
 
-    # Volume (0-25)
+    # Volume (0-25): today vs last 5 days
     vol_score = 0
     if "Trading_Volume" in df.columns and len(df) >= 6:
         v_now = df["Trading_Volume"].iloc[-1]
@@ -547,25 +382,25 @@ def compute_chip_score(inst_df: pd.DataFrame, margin_df: pd.DataFrame) -> tuple[
     notes: list[str] = []
     score = 0.0
 
-    if inst_df is not None and not inst_df.empty:
+    # Institutional net (all institutions aggregated)
+    if inst_df is not None and not inst_df.empty and {"date", "buy", "sell"}.issubset(inst_df.columns):
         tmp = inst_df.copy()
-        for c in ["buy", "sell"]:
-            if c in tmp.columns:
-                tmp[c] = to_numeric_series(tmp[c]).fillna(0.0)
-        if {"date", "buy", "sell"}.issubset(tmp.columns):
-            tmp["net"] = tmp["buy"] - tmp["sell"]
-            daily_net = tmp.groupby("date", as_index=False)["net"].sum().sort_values("date")
-            inst_net_5 = float(daily_net.tail(5)["net"].sum()) if len(daily_net) else 0.0
-            if inst_net_5 > 0:
-                score += 15
-                notes.append(f"法人近5日偏買超（合計 {inst_net_5:,.0f}）")
-            elif inst_net_5 < 0:
-                score += 5
-                notes.append(f"法人近5日偏賣超（合計 {inst_net_5:,.0f}）")
-            else:
-                score += 8
-                notes.append("法人近5日買賣超接近平衡")
+        tmp["buy"] = to_numeric_series(tmp["buy"]).fillna(0.0)
+        tmp["sell"] = to_numeric_series(tmp["sell"]).fillna(0.0)
+        tmp["net"] = tmp["buy"] - tmp["sell"]
+        daily_net = tmp.groupby("date", as_index=False)["net"].sum().sort_values("date")
+        inst_net_5 = float(daily_net.tail(5)["net"].sum()) if len(daily_net) else 0.0
+        if inst_net_5 > 0:
+            score += 15
+            notes.append(f"法人近5日偏買超（合計 {inst_net_5:,.0f}）")
+        elif inst_net_5 < 0:
+            score += 5
+            notes.append(f"法人近5日偏賣超（合計 {inst_net_5:,.0f}）")
+        else:
+            score += 8
+            notes.append("法人近5日買賣超接近平衡")
 
+    # Margin balance trend
     if margin_df is not None and not margin_df.empty and "date" in margin_df.columns:
         m = margin_df.copy().sort_values("date")
         bal_col = None
@@ -593,8 +428,35 @@ def compute_chip_score(inst_df: pd.DataFrame, margin_df: pd.DataFrame) -> tuple[
 
 
 # -----------------------------
-# Market scan: sector flow + relative volume ranking
+# 2 & 3) Market scan: sector flow + relative volume ranking
 # -----------------------------
+def compute_last_n_trading_dates(token: str, n: int = 6) -> list[str]:
+    try:
+        tdf = get_trading_dates_cached(token)
+        if tdf is not None and not tdf.empty and "date" in tdf.columns:
+            tdf = tdf.sort_values("date")
+            today = _now_date_str()
+            dates = [d for d in tdf["date"].astype(str).tolist() if d <= today]
+            return dates[-n:]
+    except Exception:
+        pass
+
+    # brute-force fallback
+    out: list[str] = []
+    d0 = datetime.now(tz=TZ) if TZ else datetime.now()
+    for i in range(0, 35):
+        ds = (d0 - timedelta(days=i)).strftime("%Y-%m-%d")
+        try:
+            df = get_daily_all_cached(token, ds)
+            if df is not None and not df.empty:
+                out.append(ds)
+                if len(out) >= n:
+                    break
+        except Exception:
+            continue
+    return sorted(out)[-n:]
+
+
 def compute_sector_flow_from_snapshot(snapshot_all: pd.DataFrame, stock_info: pd.DataFrame) -> pd.DataFrame:
     df = snapshot_all.copy()
     df["stock_id"] = df["stock_id"].astype(str)
@@ -609,16 +471,10 @@ def compute_sector_flow_from_snapshot(snapshot_all: pd.DataFrame, stock_info: pd
         raise ValueError("Snapshot 缺少 total_amount/amount 欄位")
     df[amount_col] = to_numeric_series(df[amount_col]).fillna(0.0)
 
-    if "change_rate" in df.columns:
-        df["change_rate"] = to_numeric_series(df["change_rate"]).fillna(0.0)
-        sign = np.sign(df["change_rate"])
-    elif "change_price" in df.columns:
-        df["change_price"] = to_numeric_series(df["change_price"]).fillna(0.0)
-        sign = np.sign(df["change_price"])
-    else:
-        sign = 0.0
-
+    df = ensure_change_rate(df)
+    sign = np.sign(df["change_rate"])
     df["signed_money"] = df[amount_col] * sign
+
     g = df.groupby("industry_category", as_index=False)["signed_money"].sum()
     return g.sort_values("signed_money", ascending=False)
 
@@ -632,46 +488,20 @@ def compute_volume_ranking_from_snapshot(snapshot_all: pd.DataFrame, stock_info:
     df = df.merge(info, on="stock_id", how="left")
     df["industry_category"] = df["industry_category"].fillna("其他")
 
+    # ensure numeric columns commonly used downstream
+    for c in ["close", "change_rate", "total_amount", "total_volume", "volume_ratio", "open", "high", "low", "change_price"]:
+        if c in df.columns:
+            df[c] = to_numeric_series(df[c])
+
     if "volume_ratio" in df.columns:
-        df["volume_ratio"] = to_numeric_series(df["volume_ratio"])
+        df["volume_ratio"] = pd.to_numeric(df["volume_ratio"], errors="coerce")
     else:
         tv = to_numeric_series(df.get("total_volume", pd.Series(dtype=float)))
         yv = to_numeric_series(df.get("yesterday_volume", pd.Series(dtype=float)))
         df["volume_ratio"] = tv / yv.replace(0, np.nan)
 
     df["volume_ratio"] = df["volume_ratio"].replace([np.inf, -np.inf], np.nan).fillna(0.0)
-
-    for c in ["close", "change_rate", "total_amount", "total_volume"]:
-        if c in df.columns:
-            df[c] = to_numeric_series(df[c])
-
     return df.sort_values("volume_ratio", ascending=False)
-
-
-def compute_last_n_trading_dates(token: str, n: int = 6) -> list[str]:
-    try:
-        tdf = get_trading_dates_cached(token)
-        if tdf is not None and not tdf.empty and "date" in tdf.columns:
-            tdf = tdf.sort_values("date")
-            today = _now_date_str()
-            dates = [d for d in tdf["date"].astype(str).tolist() if d <= today]
-            return dates[-n:]
-    except Exception:
-        pass
-
-    out: list[str] = []
-    d0 = datetime.now(tz=TZ) if TZ else datetime.now()
-    for i in range(0, 35):
-        ds = (d0 - timedelta(days=i)).strftime("%Y-%m-%d")
-        try:
-            df = get_daily_all_cached(token, ds)
-            if df is not None and not df.empty:
-                out.append(ds)
-                if len(out) >= n:
-                    break
-        except Exception:
-            continue
-    return sorted(out)[-n:]
 
 
 def compute_sector_flow_from_daily(token: str, stock_info: pd.DataFrame, date_str: str) -> pd.DataFrame:
@@ -692,30 +522,34 @@ def compute_sector_flow_from_daily(token: str, stock_info: pd.DataFrame, date_st
         raise ValueError("日線資料缺少 Trading_money 欄位")
     df[money_col] = to_numeric_series(df[money_col]).fillna(0.0)
 
-    if "spread" in df.columns:
-        df["spread"] = to_numeric_series(df["spread"]).fillna(0.0)
-        sign = np.sign(df["spread"])
-    else:
-        sign = 0.0
-
+    df = ensure_change_rate(df)
+    sign = np.sign(df["change_rate"])
     df["signed_money"] = df[money_col] * sign
+
     g = df.groupby("industry_category", as_index=False)["signed_money"].sum()
     return g.sort_values("signed_money", ascending=False)
 
 
 def compute_volume_ranking_from_daily(token: str, stock_info: pd.DataFrame, dates: list[str]) -> pd.DataFrame:
+    """
+    Relative volume = today's volume / avg(prev 5 days volume)
+    Returns a DF that contains today's OHLC + volume_ratio + industry info
+    """
     if len(dates) < 2:
         raise ValueError("交易日不足，無法計算相對大量")
 
     today = dates[-1]
     prevs = dates[:-1]
 
-    today_df = get_daily_all_cached(token, today)[["stock_id", "Trading_Volume", "Trading_money", "close", "spread"]].copy()
+    today_df = get_daily_all_cached(token, today).copy()
+    need_cols = ["stock_id", "Trading_Volume", "Trading_money", "close", "spread", "open", "max", "min"]
+    keep = [c for c in need_cols if c in today_df.columns]
+    today_df = today_df[keep].copy()
+
     today_df["stock_id"] = today_df["stock_id"].astype(str)
-    today_df["Trading_Volume"] = to_numeric_series(today_df["Trading_Volume"]).fillna(0.0)
-    today_df["Trading_money"] = to_numeric_series(today_df["Trading_money"]).fillna(0.0)
-    today_df["close"] = to_numeric_series(today_df["close"])
-    today_df["spread"] = to_numeric_series(today_df["spread"])
+    for c in keep:
+        if c != "stock_id":
+            today_df[c] = to_numeric_series(today_df[c])
 
     vol_frames = []
     for d in prevs[-5:]:
@@ -731,21 +565,335 @@ def compute_volume_ranking_from_daily(token: str, stock_info: pd.DataFrame, date
 
     vol_cols = [c for c in base.columns if c.startswith("vol_")]
     base["vol_avg_5"] = base[vol_cols].mean(axis=1, skipna=True).fillna(0.0)
-    base["volume_ratio"] = base.apply(lambda r: safe_div(r["Trading_Volume"], r["vol_avg_5"], default=0.0), axis=1)
+
+    if "Trading_Volume" in base.columns:
+        base["volume_ratio"] = base.apply(lambda r: safe_div(r["Trading_Volume"], r["vol_avg_5"], default=0.0), axis=1)
+    else:
+        base["volume_ratio"] = 0.0
+
     base["volume_ratio"] = base["volume_ratio"].replace([np.inf, -np.inf], 0.0).fillna(0.0)
 
     info = stock_info[["stock_id", "stock_name", "industry_category"]].drop_duplicates()
     info["stock_id"] = info["stock_id"].astype(str)
     base = base.merge(info, on="stock_id", how="left")
     base["industry_category"] = base["industry_category"].fillna("其他")
-
-    base = base.sort_values("volume_ratio", ascending=False)
     base["scan_date"] = today
-    return base
+
+    # compute change_rate (for downstream tables)
+    base = ensure_change_rate(base)
+    return base.sort_values("volume_ratio", ascending=False)
 
 
 # -----------------------------
-# 十大族群內「量大 + 漲勢大」代表股
+# NEW (Upgrade 1): Pattern classification & Trade plan engine
+# -----------------------------
+def compute_volume_ratio_from_df(df: pd.DataFrame) -> Optional[float]:
+    if df is None or df.empty or "Trading_Volume" not in df.columns:
+        return None
+    v = pd.to_numeric(df["Trading_Volume"], errors="coerce")
+    if len(v) < 6 or pd.isna(v.iloc[-1]):
+        return None
+    base = v.iloc[-6:-1].mean()
+    if pd.isna(base) or base <= 0:
+        return None
+    return float(v.iloc[-1] / base)
+
+
+def compute_structure(df: pd.DataFrame) -> dict:
+    """
+    Compute key levels:
+      prev20_high/low (exclude today), prev60_high/low, MA20/MA60, MA20 slope, trend label
+    """
+    out = {
+        "close": np.nan, "ma20": np.nan, "ma60": np.nan, "ma20_slope": np.nan,
+        "prev20_high": np.nan, "prev20_low": np.nan, "prev60_high": np.nan, "prev60_low": np.nan,
+        "range20": np.nan, "trend": "unknown"
+    }
+    if df is None or df.empty or "close" not in df.columns:
+        return out
+
+    t = df.copy()
+    t["close"] = pd.to_numeric(t["close"], errors="coerce")
+
+    if "MA20" not in t.columns:
+        t["MA20"] = t["close"].rolling(20).mean()
+    if "MA60" not in t.columns:
+        t["MA60"] = t["close"].rolling(60).mean()
+
+    high_col = _get_col(t, ["max", "high", "High"]) or "close"
+    low_col = _get_col(t, ["min", "low", "Low"]) or "close"
+    t[high_col] = pd.to_numeric(t[high_col], errors="coerce")
+    t[low_col] = pd.to_numeric(t[low_col], errors="coerce")
+
+    last = t.iloc[-1]
+    out["close"] = float(last["close"]) if pd.notna(last["close"]) else np.nan
+    out["ma20"] = float(last["MA20"]) if pd.notna(last["MA20"]) else np.nan
+    out["ma60"] = float(last["MA60"]) if pd.notna(last["MA60"]) else np.nan
+
+    if len(t) >= 25 and pd.notna(t["MA20"].iloc[-1]) and pd.notna(t["MA20"].iloc[-6]):
+        out["ma20_slope"] = float(t["MA20"].iloc[-1] - t["MA20"].iloc[-6])
+
+    if len(t) >= 21:
+        out["prev20_high"] = float(t[high_col].rolling(20).max().shift(1).iloc[-1])
+        out["prev20_low"] = float(t[low_col].rolling(20).min().shift(1).iloc[-1])
+    if len(t) >= 61:
+        out["prev60_high"] = float(t[high_col].rolling(60).max().shift(1).iloc[-1])
+        out["prev60_low"] = float(t[low_col].rolling(60).min().shift(1).iloc[-1])
+
+    if pd.notna(out["prev20_high"]) and pd.notna(out["prev20_low"]):
+        out["range20"] = float(out["prev20_high"] - out["prev20_low"])
+
+    c = out["close"]; ma20 = out["ma20"]; ma60 = out["ma60"]; slope = out["ma20_slope"]
+    if pd.notna(c) and pd.notna(ma20) and pd.notna(ma60):
+        if c > ma20 > ma60 and (pd.isna(slope) or slope > 0):
+            out["trend"] = "bull"
+        elif c < ma20 < ma60 and (pd.isna(slope) or slope < 0):
+            out["trend"] = "bear"
+        elif c > ma20:
+            out["trend"] = "mild_bull"
+        elif c < ma20:
+            out["trend"] = "mild_bear"
+        else:
+            out["trend"] = "neutral"
+    return out
+
+
+def classify_pattern(struct: dict, vol_ratio: Optional[float], profile: str) -> dict:
+    c = struct.get("close", np.nan)
+    ma20 = struct.get("ma20", np.nan)
+    prev20_high = struct.get("prev20_high", np.nan)
+    prev20_low = struct.get("prev20_low", np.nan)
+    trend = struct.get("trend", "unknown")
+
+    vol_confirm = 1.2 if profile == "大型權值股" else 1.5
+
+    if pd.notna(prev20_high) and pd.notna(c) and c > prev20_high:
+        if vol_ratio is not None and vol_ratio >= vol_confirm:
+            return {"pattern": "突破盤", "entry_type": "突破", "reason": f"突破20日區間前高 {prev20_high:.2f} 且放量（相對量 {vol_ratio:.2f}）。", "vol_confirm": vol_confirm}
+        return {"pattern": "突破盤", "entry_type": "突破（待量能確認）", "reason": f"突破20日區間前高 {prev20_high:.2f}，但量能未達確認（相對量 {vol_ratio if vol_ratio is not None else 'N/A'}）。", "vol_confirm": vol_confirm}
+
+    if pd.notna(ma20) and pd.notna(c):
+        dist = abs(c / ma20 - 1.0)
+        if dist <= 0.015 and trend not in ["bear", "mild_bear"]:
+            return {"pattern": "拉回盤", "entry_type": "拉回", "reason": "回測20MA附近且趨勢未轉空，屬回測承接型態。", "vol_confirm": vol_confirm}
+
+    if pd.notna(prev20_low) and pd.notna(c) and c < prev20_low:
+        return {"pattern": "轉弱破底", "entry_type": "避開", "reason": f"跌破20日區間低點 {prev20_low:.2f}，短線結構轉弱。", "vol_confirm": vol_confirm}
+
+    return {"pattern": "盤整盤", "entry_type": "等待", "reason": "區間整理，等待突破或回測承接。", "vol_confirm": vol_confirm}
+
+
+def classify_volume_price(price_df: pd.DataFrame, vol_ratio: Optional[float]) -> dict:
+    out = {"label": "資料不足", "detail": ""}
+    if price_df is None or price_df.empty:
+        return out
+
+    df = ensure_change_rate(price_df)
+    last = df.iloc[-1]
+
+    close = float(pd.to_numeric(last.get("close", np.nan), errors="coerce"))
+    open_ = float(pd.to_numeric(last.get("open", np.nan), errors="coerce")) if "open" in df.columns else close
+    high = float(pd.to_numeric(last.get("max", np.nan), errors="coerce")) if "max" in df.columns else close
+    low = float(pd.to_numeric(last.get("min", np.nan), errors="coerce")) if "min" in df.columns else close
+    chg = float(pd.to_numeric(last.get("change_rate", np.nan), errors="coerce")) if "change_rate" in df.columns else np.nan
+
+    if open_ == 0 or pd.isna(open_):
+        open_ = close
+
+    body_pct = abs(close - open_) / open_ * 100 if open_ else np.nan
+    range_pct = (high - low) / open_ * 100 if open_ else np.nan
+
+    vr = vol_ratio
+
+    if vr is not None and vr >= 1.8 and pd.notna(chg) and chg > 1:
+        if close >= open_:
+            return {"label": "放量上漲（健康）", "detail": f"相對量 {vr:.2f}，上漲 {chg:.2f}%：偏『起漲/續漲量』。"}
+        return {"label": "放量轉弱（風險）", "detail": f"相對量 {vr:.2f} 但收黑：留意高檔震盪/洗盤或轉弱。"}
+
+    if vr is not None and vr >= 1.5 and pd.notna(chg) and abs(chg) < 0.5:
+        return {"label": "放量不漲（出貨疑慮）", "detail": f"相對量 {vr:.2f} 但漲跌幅僅 {chg:.2f}%：常見於高檔換手/出貨。"}
+
+    if vr is not None and vr >= 1.5 and pd.notna(chg) and chg < -1:
+        return {"label": "放量下跌（風險）", "detail": f"相對量 {vr:.2f} 且下跌 {chg:.2f}%：偏『壓力出現』，不利追多。"}
+
+    if vr is not None and vr <= 0.8 and pd.notna(range_pct) and range_pct <= 2.0:
+        return {"label": "量縮整理（等待）", "detail": f"相對量 {vr:.2f} 且波動不大：偏『以盤代跌/等突破』。"}
+
+    if pd.notna(body_pct) and body_pct >= 3 and pd.notna(chg) and chg < 0:
+        return {"label": "長黑K（風險）", "detail": f"單日跌幅 {chg:.2f}%、實體約 {body_pct:.2f}%：偏弱勢K棒。"}
+
+    return {"label": "一般波動", "detail": "量價未出現典型突破/出貨訊號，建議搭配趨勢與關鍵價位判讀。"}
+
+
+def build_trade_plan(struct: dict, pattern_info: dict, vol_quality: dict, bias_alert: dict, score: dict) -> dict:
+    close = struct.get("close", np.nan)
+    ma20 = struct.get("ma20", np.nan)
+    ma60 = struct.get("ma60", np.nan)
+    prev20_high = struct.get("prev20_high", np.nan)
+    prev20_low = struct.get("prev20_low", np.nan)
+    prev60_high = struct.get("prev60_high", np.nan)
+    prev60_low = struct.get("prev60_low", np.nan)
+    range20 = struct.get("range20", np.nan)
+
+    pattern = pattern_info.get("pattern", "盤整盤")
+    entry_type = pattern_info.get("entry_type", "等待")
+    vol_confirm = pattern_info.get("vol_confirm", None)
+
+    total = float(score.get("total", 0)) if isinstance(score, dict) else 0.0
+
+    supports = [x for x in [ma20, prev20_low, ma60, prev60_low] if pd.notna(x)]
+    resistances = [x for x in [prev20_high, prev60_high] if pd.notna(x)]
+    supports = sorted({round(float(x), 2) for x in supports})
+    resistances = sorted({round(float(x), 2) for x in resistances})
+
+    buffer = 0.985
+    stop = None
+    t1 = None
+    t2 = None
+
+    lines = []
+    lines.append(f"型態判定：**{pattern}**（{entry_type}）")
+    lines.append(f"量價品質：**{vol_quality.get('label','-')}** — {vol_quality.get('detail','')}")
+    lines.append("")
+
+    # If bias danger => forbid chase
+    if (bias_alert or {}).get("level") == "danger":
+        lines.append("結論：**❌ 乖離過大，禁止追高。**")
+        lines.append("策略：只接受『回測承接』或『整理後再突破』，不在高乖離區追價。")
+        if pd.notna(ma20):
+            stop = float(ma20) * buffer
+            lines.append(f"若已持有：可用 20MA 下方緩衝作為風險點（約 {stop:.2f}）。")
+        return {"summary": "\n".join(lines), "supports": supports, "resistances": resistances, "stop": stop, "t1": t1, "t2": t2, "stance": "禁止追高"}
+
+    if pattern == "突破盤" and pd.notna(prev20_high):
+        lines.append("交易計畫（突破型）：")
+        if vol_confirm is not None:
+            lines.append(f"- 進場條件：站上 **{prev20_high:.2f}**，且相對量 ≥ **{vol_confirm:.2f}**（越接近越好）。")
+        else:
+            lines.append(f"- 進場條件：站上 **{prev20_high:.2f}** 並有量能配合。")
+        lines.append("- 操作原則：突破後不追高，優先等回測不破前高再分批。")
+
+        base_stop = prev20_high
+        if pd.notna(ma20):
+            base_stop = min(base_stop, ma20)
+        stop = float(base_stop) * buffer if pd.notna(base_stop) else None
+        lines.append(f"- 停損：跌破 **{stop:.2f}**（前高/20MA 下方緩衝）視為假突破。")
+
+        if pd.notna(prev60_high):
+            t1 = float(prev60_high)
+        if pd.notna(range20) and pd.notna(prev20_high):
+            measured = float(prev20_high + range20)
+            if t1 is None:
+                t1 = measured
+            t2 = float(prev20_high + 2 * range20)
+
+        if t1 is not None:
+            lines.append(f"- 目標1：**{t1:.2f}**，到位可先落袋。")
+        if t2 is not None:
+            lines.append(f"- 目標2：**{t2:.2f}**，以移動停利追蹤。")
+
+    elif pattern == "拉回盤" and pd.notna(ma20):
+        lines.append("交易計畫（拉回型）：")
+        lines.append(f"- 進場區：**20MA 附近（約 {ma20:.2f}）** 分批試單，觀察是否守住。")
+
+        base_stop = ma60 if pd.notna(ma60) else prev20_low
+        if pd.notna(prev20_low) and pd.notna(base_stop):
+            base_stop = min(base_stop, prev20_low)
+        stop = float(base_stop) * buffer if pd.notna(base_stop) else None
+        lines.append(f"- 停損：跌破 **{stop:.2f}**（60MA/區間低點下方緩衝）視為承接失敗。")
+
+        if pd.notna(prev20_high):
+            t1 = float(prev20_high)
+            lines.append(f"- 目標1：回到 **{t1:.2f}**（20日區間前高）。")
+        if pd.notna(prev60_high):
+            t2 = float(prev60_high)
+            lines.append(f"- 目標2：上看 **{t2:.2f}**（60日壓力/前高）。")
+
+    elif pattern == "轉弱破底":
+        lines.append("交易計畫（轉弱破底）：")
+        lines.append("- 結構已破，不建議追多。")
+        if pd.notna(prev20_low):
+            lines.append(f"- 觀察：能否站回 **{prev20_low:.2f}** 並縮量止跌。")
+        if pd.notna(ma20):
+            lines.append(f"- 反轉條件：至少站回 20MA（約 {ma20:.2f}）才重新評估。")
+        return {"summary": "\n".join(lines), "supports": supports, "resistances": resistances, "stop": None, "t1": None, "t2": None, "stance": "偏空/避開"}
+
+    else:
+        lines.append("交易計畫（盤整/等待型）：")
+        if pd.notna(prev20_high):
+            lines.append(f"- 突破條件：站上 **{prev20_high:.2f}** 再轉積極。")
+        if pd.notna(ma20):
+            lines.append(f"- 拉回承接：回測 **20MA {ma20:.2f}** 不破才有較佳RR。")
+        if pd.notna(prev20_low):
+            lines.append(f"- 風險點：跌破 **{prev20_low:.2f}** 代表區間下緣失守。")
+
+    # position suggestion
+    if total >= 80:
+        pos = "可採『試單 1/3 → 確認再加碼』"
+    elif total >= 60:
+        pos = "建議『小部位試單』，以確認型態為主"
+    else:
+        pos = "偏向觀望，等待更明確型態/量能"
+    lines.append("")
+    lines.append(f"部位建議：{pos}（總分 {total:.0f}/100）")
+    lines.append("備註：此為技術面規則化交易計畫，不構成投資建議。")
+
+    stance = "可留意" if total >= 60 else "觀望"
+    return {"summary": "\n".join(lines), "supports": supports, "resistances": resistances, "stop": stop, "t1": t1, "t2": t2, "stance": stance}
+
+
+# -----------------------------
+# NEW (Upgrade 2): Volume-price quality integrated above
+# -----------------------------
+
+# -----------------------------
+# NEW (Upgrade 3): Sector breadth & leadership concentration
+# -----------------------------
+def compute_sector_strength(market_df: pd.DataFrame, sector_flow: pd.DataFrame, top_n: int = 10) -> pd.DataFrame:
+    if market_df is None or market_df.empty or sector_flow is None or sector_flow.empty:
+        return pd.DataFrame()
+
+    df = market_df.copy()
+    df["industry_category"] = df.get("industry_category", "其他").fillna("其他")
+    df = ensure_change_rate(df)
+
+    money_col = pick_money_col(df)
+    df[money_col] = pd.to_numeric(df[money_col], errors="coerce").fillna(0.0)
+
+    top_sectors = sector_flow.sort_values("signed_money", ascending=False)["industry_category"].head(top_n).tolist()
+
+    rows = []
+    for sec in top_sectors:
+        sub = df[df["industry_category"] == sec].copy()
+        if sub.empty:
+            continue
+
+        total_cnt = int(len(sub))
+        up_cnt = int((sub["change_rate"] > 0).sum())
+        dn_cnt = int((sub["change_rate"] < 0).sum())
+        eq_cnt = total_cnt - up_cnt - dn_cnt
+
+        total_money = float(sub[money_col].sum())
+        signed_money = float((sub[money_col] * np.sign(sub["change_rate"])).sum())
+        top3_money = float(sub.sort_values(money_col, ascending=False).head(3)[money_col].sum())
+        conc = safe_div(top3_money, total_money, default=np.nan)
+
+        rows.append({
+            "族群": sec,
+            "資金偏多(億)": round(signed_money / 1e8, 2),
+            "總成交金額(億)": round(total_money / 1e8, 2),
+            "上漲家數": up_cnt,
+            "下跌家數": dn_cnt,
+            "平盤家數": eq_cnt,
+            "上漲比例(%)": round(safe_div(up_cnt, total_cnt, 0.0) * 100, 1),
+            "領導集中度Top3(%)": round(conc * 100, 1) if pd.notna(conc) else np.nan,
+        })
+
+    return pd.DataFrame(rows)
+
+
+# -----------------------------
+# Ten-sector leaders (from prior upgrade)
 # -----------------------------
 def build_sector_leaders(
     vol_rank: pd.DataFrame,
@@ -761,8 +909,7 @@ def build_sector_leaders(
     df = vol_rank.copy()
     df["industry_category"] = df.get("industry_category", "其他").fillna("其他")
     df["stock_id"] = df["stock_id"].astype(str)
-    if "stock_name" not in df.columns:
-        df["stock_name"] = ""
+    df["stock_name"] = df.get("stock_name", "").fillna("")
 
     if "volume_ratio" not in df.columns:
         df["volume_ratio"] = 0.0
@@ -776,52 +923,40 @@ def build_sector_leaders(
     vol_col = pick_volume_col(df)
     df[vol_col] = pd.to_numeric(df[vol_col], errors="coerce").fillna(0.0)
 
+    # liquidity gate
     q = df[money_col].quantile(0.30)
     df = df[df[money_col] >= q].copy()
 
-    top_sector_names = (
-        sector_flow.sort_values("signed_money", ascending=False)["industry_category"]
-        .head(top_sectors)
-        .tolist()
-    )
+    top_sector_names = sector_flow.sort_values("signed_money", ascending=False)["industry_category"].head(top_sectors).tolist()
 
     for sec in top_sector_names:
         sub = df[df["industry_category"] == sec].copy()
         if sub.empty:
             continue
-
         if only_up:
             sub = sub[sub["change_rate"] > 0].copy()
             if sub.empty:
                 continue
 
-        sub["score"] = (
-            sub["change_rate"].rank(pct=True) * 0.6
-            + sub["volume_ratio"].rank(pct=True) * 0.4
-        )
-
+        sub["score"] = sub["change_rate"].rank(pct=True) * 0.6 + sub["volume_ratio"].rank(pct=True) * 0.4
         sub = sub.sort_values(["score", money_col], ascending=False).head(k).copy()
 
         show_cols = ["stock_id", "stock_name", "change_rate", "volume_ratio", money_col, vol_col]
         if "close" in sub.columns:
             show_cols.append("close")
 
-        sub = sub[show_cols].rename(
-            columns={
-                "change_rate": "漲跌幅(%)",
-                "volume_ratio": "量比",
-                money_col: "成交金額",
-                vol_col: "成交量",
-                "close": "價格",
-            }
-        )
-        out[sec] = sub
-
+        out[sec] = sub[show_cols].rename(columns={
+            "change_rate": "漲跌幅(%)",
+            "volume_ratio": "量比",
+            money_col: "成交金額",
+            vol_col: "成交量",
+            "close": "價格",
+        })
     return out
 
 
 # -----------------------------
-# 第八分類：主題族群資金雷達
+# Theme radar (with breadth & concentration)
 # -----------------------------
 def compute_theme_radar(
     market_df: pd.DataFrame,
@@ -845,7 +980,6 @@ def compute_theme_radar(
     df["industry_category"] = df.get("industry_category", "其他").fillna("其他")
 
     df = ensure_change_rate(df)
-
     money_col = pick_money_col(df)
     vol_col = pick_volume_col(df)
 
@@ -855,8 +989,7 @@ def compute_theme_radar(
     df["signed_money"] = df[money_col] * np.sign(df["change_rate"].fillna(0.0))
 
     summary_rows = []
-    leaders = {}
-
+    leaders: dict = {}
     money_threshold = float(money_threshold_yi) * 1e8
 
     for theme, rule in theme_groups.items():
@@ -871,46 +1004,50 @@ def compute_theme_radar(
 
         sub = df[mask].copy()
         if sub.empty:
-            summary_rows.append(
-                {
-                    "主題": theme,
-                    "總成交金額(億)": 0.0,
-                    "資金偏多(億)": 0.0,
-                    "平均漲跌幅(%)": 0.0,
-                    "中位數漲跌幅(%)": 0.0,
-                    "上漲家數": 0,
-                    "下跌家數": 0,
-                    "平盤家數": 0,
-                }
-            )
+            summary_rows.append({
+                "主題": theme,
+                "總成交金額(億)": 0.0,
+                "資金偏多(億)": 0.0,
+                "平均漲跌幅(%)": 0.0,
+                "中位數漲跌幅(%)": 0.0,
+                "上漲家數": 0,
+                "下跌家數": 0,
+                "平盤家數": 0,
+                "上漲比例(%)": 0.0,
+                "領導集中度Top3(%)": np.nan,
+            })
             leaders[theme] = pd.DataFrame()
             continue
 
-        total_money_yi = sub[money_col].sum() / 1e8
-        signed_money_yi = sub["signed_money"].sum() / 1e8
+        total_cnt = int(len(sub))
+        up_cnt = int((sub["change_rate"] > 0).sum())
+        dn_cnt = int((sub["change_rate"] < 0).sum())
+        eq_cnt = total_cnt - up_cnt - dn_cnt
+
+        total_money = float(sub[money_col].sum())
+        signed_money = float(sub["signed_money"].sum())
         avg_chg = float(sub["change_rate"].mean())
         med_chg = float(sub["change_rate"].median())
-        up = int((sub["change_rate"] > 0).sum())
-        dn = int((sub["change_rate"] < 0).sum())
-        eq = int((sub["change_rate"] == 0).sum())
 
-        summary_rows.append(
-            {
-                "主題": theme,
-                "總成交金額(億)": round(total_money_yi, 2),
-                "資金偏多(億)": round(signed_money_yi, 2),
-                "平均漲跌幅(%)": round(avg_chg, 2),
-                "中位數漲跌幅(%)": round(med_chg, 2),
-                "上漲家數": up,
-                "下跌家數": dn,
-                "平盤家數": eq,
-            }
-        )
+        top3_money = float(sub.sort_values(money_col, ascending=False).head(3)[money_col].sum())
+        conc = safe_div(top3_money, total_money, default=np.nan)
+
+        summary_rows.append({
+            "主題": theme,
+            "總成交金額(億)": round(total_money / 1e8, 2),
+            "資金偏多(億)": round(signed_money / 1e8, 2),
+            "平均漲跌幅(%)": round(avg_chg, 2),
+            "中位數漲跌幅(%)": round(med_chg, 2),
+            "上漲家數": up_cnt,
+            "下跌家數": dn_cnt,
+            "平盤家數": eq_cnt,
+            "上漲比例(%)": round(safe_div(up_cnt, total_cnt, 0.0) * 100, 1),
+            "領導集中度Top3(%)": round(conc * 100, 1) if pd.notna(conc) else np.nan,
+        })
 
         pick = sub[sub[money_col] >= money_threshold].copy()
         if pick.empty:
             pick = sub.copy()
-
         pick = pick.sort_values(["change_rate", money_col], ascending=[False, False]).head(top_k).copy()
 
         show_cols = ["stock_id", "stock_name", "industry_category", "change_rate", money_col, vol_col]
@@ -919,16 +1056,14 @@ def compute_theme_radar(
         if "close" in pick.columns:
             show_cols.append("close")
 
-        pick = pick[show_cols].rename(
-            columns={
-                "industry_category": "產業",
-                "change_rate": "漲跌幅(%)",
-                money_col: "成交金額",
-                vol_col: "成交量",
-                "volume_ratio": "量比",
-                "close": "價格",
-            }
-        )
+        pick = pick[show_cols].rename(columns={
+            "industry_category": "產業",
+            "change_rate": "漲跌幅(%)",
+            money_col: "成交金額",
+            vol_col: "成交量",
+            "volume_ratio": "量比",
+            "close": "價格",
+        })
         pick["成交金額(億)"] = pick["成交金額"] / 1e8
         leaders[theme] = pick
 
@@ -937,7 +1072,114 @@ def compute_theme_radar(
 
 
 # -----------------------------
-# Main compute
+# Bias alert system
+# -----------------------------
+def classify_stock_profile(stock_id: str, stock_info: pd.DataFrame) -> str:
+    sid = str(stock_id).strip()
+    if sid in LARGE_CAP_IDS:
+        return "大型權值股"
+    try:
+        row = stock_info[stock_info["stock_id"].astype(str) == sid]
+        if not row.empty:
+            ind = str(row.iloc[-1].get("industry_category", "") or "")
+            if ind == "金融保險業":
+                return "大型權值股"
+    except Exception:
+        pass
+    return "中小型飆股"
+
+
+def get_bias_alert(bias20: float, bias60: float, profile: str) -> dict:
+    out = {"level": "na", "headline": "乖離率資料不足", "detail": "", "thresholds": {}}
+    if bias20 is None or pd.isna(bias20):
+        return out
+
+    b20 = float(bias20)
+    b60 = float(bias60) if (bias60 is not None and not pd.isna(bias60)) else np.nan
+
+    endings = (
+        "乖離過大常見三種結局：\n"
+        "1) 直接崩跌：股價快速下跌去找均線。\n"
+        "2) 橫盤整理：以盤代跌，等均線慢慢上來。\n"
+        "3) 假突破真拉回：再漲一點點，然後瞬間急殺。"
+    )
+
+    if profile == "大型權值股":
+        out["thresholds"] = {"warn_hi": 10.0, "warn_lo": -10.0}
+        if b20 >= 10.0:
+            out["level"] = "danger"
+            out["headline"] = f"❌ 乖離過大，禁止追高（20MA乖離 {b20:.2f}% ≥ +10%）"
+            out["detail"] = "大型權值股推動不易，+10% 以上常見波段高檔。\n操作建議：不追價；偏向分批調節。\n\n" + endings
+        elif b20 <= -10.0:
+            out["level"] = "buy"
+            out["headline"] = f"✅ 超賣區（20MA乖離 {b20:.2f}% ≤ -10%）"
+            out["detail"] = "大型權值股 -10% 常見恐慌超賣。\n操作建議：可留意分批布局，仍以止跌/轉強確認。"
+        elif b20 >= 6.0:
+            out["level"] = "warn"
+            out["headline"] = f"⚠️ 乖離偏高（20MA乖離 {b20:.2f}%）"
+            out["detail"] = "距離 +10% 警戒線不遠，RR開始下降。\n操作建議：避免追高，等回測20MA/整理。"
+        else:
+            out["level"] = "ok"
+            out["headline"] = f"乖離合理（20MA乖離 {b20:.2f}%）"
+            out["detail"] = "乖離未達警戒，仍需搭配趨勢/量能/籌碼。"
+    else:
+        out["thresholds"] = {"warn_hi": 15.0, "danger_hi": 20.0, "mania": 30.0, "warn_lo": -12.0}
+        if b20 >= 30.0:
+            out["level"] = "danger"
+            out["headline"] = f"❌ 瘋狂區：禁止追高（20MA乖離 {b20:.2f}% ≥ +30%）"
+            out["detail"] = "末升段噴出，RR極差。\n操作建議：不追價；偏向落袋/移動停利。\n\n" + endings
+        elif b20 >= 20.0:
+            out["level"] = "danger"
+            out["headline"] = f"❌ 高風險：禁止追高（20MA乖離 {b20:.2f}% ≥ +20%）"
+            out["detail"] = "+20% 隨時可能長黑修正。\n操作建議：不追價；偏向移動停利。\n\n" + endings
+        elif b20 >= 15.0:
+            out["level"] = "warn"
+            out["headline"] = f"⚠️ 警戒區（20MA乖離 {b20:.2f}% ≥ +15%）"
+            out["detail"] = "+15% 後勝率與RR開始變差。\n操作建議：寧可錯過，不可做錯；等回測/整理。"
+        elif b20 <= -12.0:
+            out["level"] = "buy"
+            out["headline"] = f"✅ 偏超賣（20MA乖離 {b20:.2f}% ≤ -12%）"
+            out["detail"] = "中小型股超賣彈性大但也可能續跌。\n操作建議：分批試單 + 嚴格停損。"
+        else:
+            out["level"] = "ok"
+            out["headline"] = f"乖離合理（20MA乖離 {b20:.2f}%）"
+            out["detail"] = "可搭配趨勢/量能/題材強度綜合判讀。"
+
+    if pd.notna(b60) and abs(b60) >= 25 and out["level"] in ["ok", "warn", "buy"]:
+        out["detail"] += f"\n\n補充：60MA 乖離 {b60:.2f}% 已偏極端（中期過熱/過冷），請提高風險控管。"
+    return out
+
+
+def get_ai_advice(stock_id: str, stock_info: pd.DataFrame, price_df: pd.DataFrame, score: dict, bias_profile_mode: str) -> dict:
+    if bias_profile_mode == "大型權值股":
+        profile = "大型權值股"
+    elif bias_profile_mode == "中小型飆股":
+        profile = "中小型飆股"
+    else:
+        profile = classify_stock_profile(stock_id, stock_info)
+
+    b20 = np.nan
+    b60 = np.nan
+    if price_df is not None and not price_df.empty:
+        if "BIAS20" in price_df.columns and pd.notna(price_df["BIAS20"].iloc[-1]):
+            b20 = float(price_df["BIAS20"].iloc[-1])
+        if "BIAS60" in price_df.columns and pd.notna(price_df["BIAS60"].iloc[-1]):
+            b60 = float(price_df["BIAS60"].iloc[-1])
+
+    bias_alert = get_bias_alert(b20, b60, profile)
+
+    total = float(score.get("total", 0)) if isinstance(score, dict) else 0.0
+    stance = "中性"
+    if total >= 75:
+        stance = "偏多"
+    elif total <= 45:
+        stance = "偏空"
+
+    return {"profile": profile, "bias_alert": bias_alert, "stance": stance}
+
+
+# -----------------------------
+# Orchestrator
 # -----------------------------
 def run_all_features(
     token: str,
@@ -951,7 +1193,7 @@ def run_all_features(
 ) -> dict:
     res: dict = {"stock_id": stock_id, "scan_mode": scan_mode, "ts": datetime.utcnow().isoformat()}
 
-    # 1) daily + realtime patch
+    # 1) Daily + patch
     start_date = (datetime.now(tz=TZ) - timedelta(days=260) if TZ else datetime.now() - timedelta(days=260)).strftime("%Y-%m-%d")
     daily = get_daily_one_cached(token, stock_id, start_date, None)
     snap = get_snapshot_one_cached(token, stock_id)
@@ -966,11 +1208,10 @@ def run_all_features(
             patch_date = str(patched["date"].iloc[-1])
 
         patched = patched.copy()
-        patched["close"] = to_numeric_series(patched["close"])
-        if "Trading_Volume" in patched.columns:
-            patched["Trading_Volume"] = to_numeric_series(patched["Trading_Volume"])
+        for c in ["close", "open", "max", "min", "Trading_Volume", "Trading_money", "spread"]:
+            if c in patched.columns:
+                patched[c] = to_numeric_series(patched[c])
 
-        # MA
         patched["MA20"] = patched["close"].rolling(20).mean()
         patched["MA60"] = patched["close"].rolling(60).mean()
 
@@ -982,14 +1223,13 @@ def run_all_features(
 
         res["price_df"] = patched
         res["patch_meta"] = {"patched": patched_flag, "patch_date": patch_date}
-        res["snap_row"] = snap.iloc[0].to_dict() if (snap is not None and not snap.empty) else {}
     else:
         res["price_df"] = pd.DataFrame()
         res["patch_meta"] = {"patched": False, "patch_date": ""}
-        res["snap_row"] = {}
 
-    # 4) scoring base + chip score
+    # 4) Score + chip
     score = compute_score(res["price_df"])
+
     chip_start = (datetime.now(tz=TZ) - timedelta(days=180) if TZ else datetime.now() - timedelta(days=180)).strftime("%Y-%m-%d")
     inst_df = get_institutional_cached(token, stock_id, chip_start, None)
     margin_df = get_margin_cached(token, stock_id, chip_start, None)
@@ -999,14 +1239,13 @@ def run_all_features(
     score["total"] = score["trend"] + score["momentum"] + score["volume"] + score["chip"]
     score["notes"].extend(chip_notes)
 
-    # 乖離率警報（寫入 AI advice / notes）
     ai = get_ai_advice(stock_id, stock_info, res["price_df"], score, bias_profile_mode)
     res["ai_advice"] = ai
     if ai.get("bias_alert", {}).get("level") in ["danger", "warn"]:
         score["notes"].append(ai["bias_alert"]["headline"])
     res["score"] = score
 
-    # 2 & 3) market scan
+    # 2 & 3) Market scan
     meta = {"source": "", "scan_date": ""}
     sector_flow = pd.DataFrame()
     vol_rank = pd.DataFrame()
@@ -1034,37 +1273,43 @@ def run_all_features(
     res["sector_flow"] = sector_flow
     res["volume_rank"] = vol_rank
 
-    # 十大族群代表股
-    res["sector_leaders"] = build_sector_leaders(
-        vol_rank=vol_rank,
-        sector_flow=sector_flow,
-        top_sectors=10,
-        k=sector_pick_k,
-        only_up=True,
-    )
+    # sector strength & leaders
+    res["sector_strength"] = compute_sector_strength(vol_rank, sector_flow, top_n=10)
+    res["sector_leaders"] = build_sector_leaders(vol_rank, sector_flow, top_sectors=10, k=sector_pick_k, only_up=True)
 
-    # 6) chip raw
+    # chip raw
     res["inst_raw"] = inst_df
     res["margin_raw"] = margin_df
 
-    # 7) revenue
+    # 7) revenue raw
     rev_start = (datetime.now(tz=TZ) - timedelta(days=365 * 6) if TZ else datetime.now() - timedelta(days=365 * 6)).strftime("%Y-%m-%d")
     res["revenue_raw"] = get_month_revenue_cached(token, stock_id, rev_start)
 
     # 8) theme radar
-    res["theme_radar"] = compute_theme_radar(
-        market_df=vol_rank,
-        stock_info=stock_info,
-        theme_groups=THEME_GROUPS,
-        top_k=theme_top_k,
-        money_threshold_yi=theme_money_threshold_yi,
-    )
+    res["theme_radar"] = compute_theme_radar(vol_rank, stock_info, THEME_GROUPS, top_k=theme_top_k, money_threshold_yi=theme_money_threshold_yi)
+
+    # 9) trade plan engine
+    profile = ai.get("profile", "中小型飆股")
+    vol_ratio = compute_volume_ratio_from_df(res["price_df"])
+    struct = compute_structure(res["price_df"])
+    pattern_info = classify_pattern(struct, vol_ratio, profile)
+    vol_quality = classify_volume_price(res["price_df"], vol_ratio)
+    plan = build_trade_plan(struct, pattern_info, vol_quality, ai.get("bias_alert", {}), score)
+
+    res["trade_engine"] = {
+        "profile": profile,
+        "vol_ratio": vol_ratio,
+        "structure": struct,
+        "pattern": pattern_info,
+        "vol_quality": vol_quality,
+        "plan": plan,
+    }
 
     return res
 
 
 # -----------------------------
-# UI inputs
+# UI
 # -----------------------------
 token = st.secrets.get("FINMIND_TOKEN") or os.environ.get("FINMIND_API_TOKEN") or ""
 if not token:
@@ -1078,12 +1323,7 @@ top_n = st.sidebar.slider("相對大量榜 Top N", min_value=20, max_value=200, 
 
 st.sidebar.divider()
 st.sidebar.subheader("乖離率警報")
-bias_profile_mode = st.sidebar.selectbox(
-    "股票屬性（影響乖離警戒線）",
-    options=["自動判斷", "大型權值股", "中小型飆股"],
-    index=0,
-)
-st.sidebar.caption("自動判斷：權值名單/金融股 → 大型權值；其餘 → 中小型飆股。")
+bias_profile_mode = st.sidebar.selectbox("股票屬性（影響乖離警戒線）", options=["自動判斷", "大型權值股", "中小型飆股"], index=0)
 
 st.sidebar.divider()
 st.sidebar.subheader("十大族群代表股")
@@ -1100,8 +1340,8 @@ if "result" not in st.session_state:
 with st.spinner("載入股票清單與產業分類..."):
     stock_info = get_stock_info_cached(token)
 
-if st.sidebar.button("一鍵更新（含第八分類）"):
-    with st.spinner("更新中：即時補丁 / 全市場掃描 / 籌碼 / 營收 / 主題族群雷達 / 乖離警報..."):
+if st.sidebar.button("一鍵更新（含交易計畫引擎）"):
+    with st.spinner("更新中：即時補丁 / 全市場掃描 / 籌碼 / 營收 / 主題雷達 / 交易計畫..."):
         st.session_state["result"] = run_all_features(
             token=token,
             stock_id=target_sid,
@@ -1118,25 +1358,25 @@ if st.sidebar.button("清除結果"):
     st.session_state["result"] = None
     st.sidebar.info("已清除")
 
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
-    ["1. 即時補丁 + 技術圖/評分", "2. 十大族群資金流向", "3. 全台股相對大量榜", "4. 籌碼照妖鏡", "5. 營收診斷", "8. 主題族群資金雷達"]
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
+    ["1. 健診/技術圖", "2. 十大族群資金流向", "3. 全台股相對大量榜", "4. 籌碼照妖鏡", "5. 營收診斷", "8. 主題族群雷達", "9. 交易計畫引擎"]
 )
 
 res = st.session_state.get("result")
 
-# ---------------------------------
-# 1) 即時補丁 + 技術圖 + 評分 + 乖離率 + 警報
-# ---------------------------------
+# -----------------------------
+# Tab 1
+# -----------------------------
 with tab1:
-    st.subheader("即時股價補丁 + 三線技術圖 + 扣抵值 + 乖離率 + 自動評分（0-100）")
-
+    st.subheader("健診：即時補丁 + 三線技術圖 + 乖離率 + 評分")
     if res is None or res.get("stock_id") != target_sid:
-        st.info("請先按左側「一鍵更新（含第八分類）」。")
+        st.info("請先按左側「一鍵更新（含交易計畫引擎）」。")
     else:
         t = res.get("price_df", pd.DataFrame())
         meta = res.get("patch_meta", {})
         score = res.get("score", {})
         ai = res.get("ai_advice", {})
+        te = res.get("trade_engine", {})
 
         if t is None or t.empty:
             st.error("日線資料為空。")
@@ -1150,7 +1390,9 @@ with tab1:
             bias20 = float(t["BIAS20"].iloc[-1]) if "BIAS20" in t.columns and pd.notna(t["BIAS20"].iloc[-1]) else np.nan
             bias60 = float(t["BIAS60"].iloc[-1]) if "BIAS60" in t.columns and pd.notna(t["BIAS60"].iloc[-1]) else np.nan
 
-            # 健診股票欄位（6格）
+            pattern = te.get("pattern", {}).get("pattern", "-")
+            vq = te.get("vol_quality", {}).get("label", "-")
+
             c1, c2, c3, c4, c5, c6 = st.columns(6)
             c1.metric("最新價（含補丁）", f"{float(t['close'].iloc[-1]):.2f}")
             c2.metric("資料日期", patch_date)
@@ -1159,40 +1401,41 @@ with tab1:
             c5.metric("20MA 乖離率(%)", "-" if pd.isna(bias20) else f"{bias20:.2f}%")
             c6.metric("60MA 乖離率(%)", "-" if pd.isna(bias60) else f"{bias60:.2f}%")
 
+            x1, x2 = st.columns(2)
+            x1.metric("型態", pattern)
+            x2.metric("量價品質", vq)
+
             if patched_flag:
                 st.success(f"已套用 Pro 即時快照補丁：新增 {patch_date} 盤中資料列。")
             else:
                 st.caption("本次未新增補丁（日線已是最新日期或快照無資料）。")
 
-            # 乖離率警報（你提供的核心邏輯）
+            # Bias alert
             st.markdown("### 乖離率警報（地心引力 / 均值回歸）")
             st.caption(f"股票屬性：{ai.get('profile','-')}（可在左側調整）")
-
             alert = ai.get("bias_alert", {})
             level = alert.get("level", "na")
-            headline = alert.get("headline", "")
-            detail = alert.get("detail", "")
 
             if level == "danger":
-                st.error(headline)
-                if detail:
-                    st.text(detail)
+                st.error(alert.get("headline", ""))
+                if alert.get("detail"):
+                    st.text(alert["detail"])
             elif level == "warn":
-                st.warning(headline)
-                if detail:
-                    st.text(detail)
+                st.warning(alert.get("headline", ""))
+                if alert.get("detail"):
+                    st.text(alert["detail"])
             elif level == "buy":
-                st.success(headline)
-                if detail:
-                    st.text(detail)
+                st.success(alert.get("headline", ""))
+                if alert.get("detail"):
+                    st.text(alert["detail"])
             elif level == "ok":
-                st.info(headline)
-                if detail:
-                    st.text(detail)
+                st.info(alert.get("headline", ""))
+                if alert.get("detail"):
+                    st.text(alert["detail"])
             else:
                 st.info("乖離率資料不足，無法觸發警報。")
 
-            # 分數
+            # Score
             s1, s2, s3, s4, s5 = st.columns(5)
             s1.metric("總分", f"{score.get('total', 0):.0f} / 100")
             s2.metric("趨勢", f"{score.get('trend', 0):.0f} / 25")
@@ -1204,34 +1447,32 @@ with tab1:
             if notes:
                 st.caption("診斷摘要：" + "；".join([str(x) for x in notes[-6:]]))
 
-            # 三線技術圖：Close + MA20(螢光黃) + MA60(桃紅) + 黃色 X
+            # Three-line technical chart
             fig = go.Figure()
             fig.add_trace(go.Scatter(x=t["date"], y=t["close"], name="Close", mode="lines"))
             fig.add_trace(go.Scatter(x=t["date"], y=t["MA20"], name="MA20", mode="lines", line=dict(color="#F7FF00", width=2)))
             fig.add_trace(go.Scatter(x=t["date"], y=t["MA60"], name="MA60", mode="lines", line=dict(color="#FF2DA4", width=2)))
-            fig.add_trace(
-                go.Scatter(
-                    x=[t["date"].iloc[-1]],
-                    y=[t["close"].iloc[-1]],
-                    mode="markers",
-                    marker=dict(symbol="x", size=12, color="#FFD400", line=dict(width=2, color="#FFD400")),
-                    showlegend=False,
-                )
-            )
+            fig.add_trace(go.Scatter(
+                x=[t["date"].iloc[-1]],
+                y=[t["close"].iloc[-1]],
+                mode="markers",
+                marker=dict(symbol="x", size=12, color="#FFD400", line=dict(width=2, color="#FFD400")),
+                showlegend=False
+            ))
             fig.update_layout(height=520, margin=dict(l=10, r=10, t=30, b=10))
             st.plotly_chart(fig, use_container_width=True)
 
-# ---------------------------------
-# 2) 十大族群資金流向 + 族群代表股
-# ---------------------------------
+# -----------------------------
+# Tab 2
+# -----------------------------
 with tab2:
-    st.subheader("十大族群資金流向 + 族群代表股（量大 + 漲勢大）")
-
+    st.subheader("十大族群資金流向 + 廣度/集中度 + 代表股")
     if res is None:
-        st.info("請先按左側「一鍵更新（含第八分類）」。")
+        st.info("請先按左側「一鍵更新（含交易計畫引擎）」。")
     else:
         meta = res.get("market_meta", {})
         sector_flow = res.get("sector_flow", pd.DataFrame())
+        strength = res.get("sector_strength", pd.DataFrame())
 
         if sector_flow is None or sector_flow.empty:
             st.error("族群資金流向資料為空。")
@@ -1244,8 +1485,14 @@ with tab2:
 
             fig = go.Figure()
             fig.add_trace(go.Bar(x=show["族群"], y=show["資金流向(億)"], name="資金流向(億)"))
-            fig.update_layout(height=420, margin=dict(l=10, r=10, t=30, b=10), xaxis_title="族群", yaxis_title="資金流向(億)")
+            fig.update_layout(height=420, margin=dict(l=10, r=10, t=30, b=10))
             st.plotly_chart(fig, use_container_width=True)
+
+        st.markdown("### 族群強弱（Breadth + Leadership）")
+        if strength is None or strength.empty:
+            st.info("本次無法計算族群廣度/集中度（資料不足）。")
+        else:
+            st.dataframe(strength, use_container_width=True)
 
         leaders = res.get("sector_leaders", {})
         if leaders:
@@ -1257,14 +1504,13 @@ with tab2:
                         df_show["成交金額(億)"] = df_show["成交金額"] / 1e8
                     st.dataframe(df_show, use_container_width=True)
 
-# ---------------------------------
-# 3) 全台股相對大量榜
-# ---------------------------------
+# -----------------------------
+# Tab 3
+# -----------------------------
 with tab3:
     st.subheader("全台股相對大量榜（全市場量能增溫排行）")
-
     if res is None:
-        st.info("請先按左側「一鍵更新（含第八分類）」。")
+        st.info("請先按左側「一鍵更新（含交易計畫引擎）」。")
     else:
         meta = res.get("market_meta", {})
         vol_rank = res.get("volume_rank", pd.DataFrame())
@@ -1273,21 +1519,20 @@ with tab3:
         else:
             st.caption(f"資料來源：{meta.get('source','')}；掃描日期：{meta.get('scan_date','')}")
             cols = ["stock_id", "stock_name", "industry_category", "volume_ratio"]
-            for extra in ["close", "change_rate", "total_amount", "Trading_money", "total_volume", "Trading_Volume", "spread", "scan_date"]:
+            for extra in ["close", "change_rate", "total_amount", "Trading_money", "Trading_Volume", "spread", "scan_date"]:
                 if extra in vol_rank.columns and extra not in cols:
                     cols.append(extra)
             top_df = vol_rank[cols].head(top_n).copy()
             top_df.insert(0, "rank", range(1, len(top_df) + 1))
             st.dataframe(top_df, use_container_width=True)
 
-# ---------------------------------
-# 4) 籌碼照妖鏡
-# ---------------------------------
+# -----------------------------
+# Tab 4
+# -----------------------------
 with tab4:
     st.subheader("籌碼照妖鏡（法人買賣超 + 散戶融資對照圖）")
-
     if res is None:
-        st.info("請先按左側「一鍵更新（含第八分類）」。")
+        st.info("請先按左側「一鍵更新（含交易計畫引擎）」。")
     else:
         inst_df = res.get("inst_raw", pd.DataFrame())
         margin_df = res.get("margin_raw", pd.DataFrame())
@@ -1325,14 +1570,13 @@ with tab4:
             fig.update_yaxes(title_text="融資餘額", secondary_y=True)
             st.plotly_chart(fig, use_container_width=True)
 
-# ---------------------------------
-# 5) 營收診斷
-# ---------------------------------
+# -----------------------------
+# Tab 5
+# -----------------------------
 with tab5:
     st.subheader("營收診斷（月營收年增率圖表）")
-
     if res is None:
-        st.info("請先按左側「一鍵更新（含第八分類）」。")
+        st.info("請先按左側「一鍵更新（含交易計畫引擎）」。")
     else:
         rev = res.get("revenue_raw", pd.DataFrame())
         if rev is None or rev.empty:
@@ -1356,14 +1600,13 @@ with tab5:
             fig.update_layout(height=520, margin=dict(l=10, r=10, t=30, b=10), yaxis_title="年增率(%)")
             st.plotly_chart(fig, use_container_width=True)
 
-# ---------------------------------
-# 8) 主題族群資金雷達
-# ---------------------------------
+# -----------------------------
+# Tab 6
+# -----------------------------
 with tab6:
-    st.subheader("第八分類：主題族群資金雷達（資金狀況 + 當日族群個股漲幅）")
-
+    st.subheader("第八分類：主題族群資金雷達（含廣度/集中度）")
     if res is None:
-        st.info("請先按左側「一鍵更新（含第八分類）」。")
+        st.info("請先按左側「一鍵更新（含交易計畫引擎）」。")
     else:
         meta = res.get("market_meta", {})
         radar = res.get("theme_radar", {"summary": pd.DataFrame(), "leaders": {}})
@@ -1371,19 +1614,17 @@ with tab6:
         leaders = radar.get("leaders", {})
 
         st.caption(f"資料來源：{meta.get('source','')}；掃描日期：{meta.get('scan_date','')}")
-
         if summary is None or summary.empty:
-            st.error("主題族群雷達資料為空（可能非交易時段或全市場掃描失敗）。")
+            st.error("主題族群雷達資料為空（可能非交易時段或掃描失敗）。")
         else:
-            st.markdown("### 主題族群資金概況")
             st.dataframe(summary, use_container_width=True)
 
             fig = go.Figure()
             fig.add_trace(go.Bar(x=summary["主題"], y=summary["資金偏多(億)"], name="資金偏多(億)"))
-            fig.update_layout(height=420, margin=dict(l=10, r=10, t=30, b=10), xaxis_title="主題", yaxis_title="資金偏多(億)")
+            fig.update_layout(height=420, margin=dict(l=10, r=10, t=30, b=10))
             st.plotly_chart(fig, use_container_width=True)
 
-            st.markdown(f"### 各主題：當日個股漲幅概況（Top {theme_top_k}；成交金額門檻 {theme_money_threshold_yi} 億）")
+            st.markdown(f"### 各主題：當日個股漲幅（Top {theme_top_k}；成交金額門檻 {theme_money_threshold_yi} 億）")
             for theme in THEME_GROUPS.keys():
                 df_pick = leaders.get(theme, pd.DataFrame())
                 with st.expander(f"{theme}", expanded=False):
@@ -1391,3 +1632,39 @@ with tab6:
                         st.info("本主題本次未抓到資料（可能名單未命中或資料源未含該股）。")
                     else:
                         st.dataframe(df_pick, use_container_width=True)
+
+# -----------------------------
+# Tab 7
+# -----------------------------
+with tab7:
+    st.subheader("交易計畫引擎（型態分類 + 量價品質 + 可執行計畫）")
+    if res is None:
+        st.info("請先按左側「一鍵更新（含交易計畫引擎）」。")
+    else:
+        te = res.get("trade_engine", {})
+        plan = (te.get("plan") or {})
+        if not te:
+            st.error("交易計畫引擎資料不足。")
+        else:
+            vol_ratio = te.get("vol_ratio")
+            st.caption(f"股票屬性：{te.get('profile','-')}；相對量（今/近5日均量）：{vol_ratio:.2f}" if vol_ratio is not None else f"股票屬性：{te.get('profile','-')}；相對量：N/A")
+
+            # Plan text
+            st.markdown(plan.get("summary", ""))
+
+            # Key levels
+            st.markdown("### 關鍵價位")
+            sup = plan.get("supports", [])
+            resis = plan.get("resistances", [])
+            c1, c2 = st.columns(2)
+            c1.write("支撐帶：" + ("、".join([f"{x:.2f}" for x in sup]) if sup else "-"))
+            c2.write("壓力帶：" + ("、".join([f"{x:.2f}" for x in resis]) if resis else "-"))
+
+            st.markdown("### 計畫數值（若有）")
+            n1, n2, n3 = st.columns(3)
+            stop = plan.get("stop")
+            t1 = plan.get("t1")
+            t2 = plan.get("t2")
+            n1.metric("停損參考", "-" if stop is None else f"{stop:.2f}")
+            n2.metric("目標1", "-" if t1 is None else f"{t1:.2f}")
+            n3.metric("目標2", "-" if t2 is None else f"{t2:.2f}")
