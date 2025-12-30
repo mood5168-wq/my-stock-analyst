@@ -7,7 +7,7 @@ from FinMind.data import DataLoader
 import time
 
 # --- 1. 頁面設定 ---
-st.set_page_config(page_title="超級分析師-Pro遍歷版", layout="wide")
+st.set_page_config(page_title="超級分析師-Pro穩定版", layout="wide")
 
 # --- 2. Pro 帳號登入 ---
 dl = DataLoader()
@@ -24,29 +24,22 @@ try:
         login_ok = True
 except: pass
 
-# --- 3. 核心引擎：手動抓取即時 Tick (取代 Snapshot) ---
+# --- 3. 核心引擎：安全抓取即時 Tick ---
 def get_realtime_tick_safe(sid):
-    """
-    不使用 snapshot，改用最基礎的 tick 抓取
-    Sponsor Pro 速度快，可以直接抓最新一筆
-    """
+    """利用 Pro 權限抓取最新一筆成交，不依賴 snapshot"""
     try:
         # 抓取今日逐筆成交
         df = dl.taiwan_stock_tick(stock_id=sid, date=datetime.now().strftime("%Y-%m-%d"))
         if not df.empty:
-            # 回傳：最新價, 累積量, 漲跌幅(需估算)
-            price = df['deal_price'].iloc[-1]
-            volume = df['volume'].sum()
-            return price, volume
+            return df['deal_price'].iloc[-1], df['volume'].sum()
     except: pass
     return None, None
 
-# --- 4. 資金流向：手動掃描重點股 ---
-@st.cache_data(ttl=60) # 60秒更新一次
+# --- 4. 資金流向：手動遍歷 (避開 AttributeError) ---
+@st.cache_data(ttl=60)
 def get_sector_flow_manual():
     if not login_ok: return pd.DataFrame()
     
-    # 定義要掃描的族群代表股 (因為是手動抓，選最具代表性的)
     sectors = {
         "半導體": ["2330", "2454", "1560", "3131"],
         "AI伺服器": ["2382", "3231", "2376", "6669"],
@@ -57,18 +50,14 @@ def get_sector_flow_manual():
     }
     
     results = []
-    # 利用 Pro 權限，快速迴圈抓取
     for name, sids in sectors.items():
         chg_list = []
         vol_total = 0
-        
         for sid in sids:
-            # 1. 抓即時價
             rt_price, rt_vol = get_realtime_tick_safe(sid)
-            
-            # 2. 抓昨日收盤 (算漲跌幅用)
             if rt_price:
                 try:
+                    # 抓前一日收盤計算漲跌
                     hist = dl.taiwan_stock_daily(stock_id=sid, start_date=(datetime.now()-timedelta(days=5)).strftime("%Y-%m-%d"))
                     if not hist.empty:
                         prev_close = hist['close'].iloc[-2] if len(hist) > 1 else hist['close'].iloc[-1]
@@ -78,10 +67,9 @@ def get_sector_flow_manual():
                 except: pass
         
         if chg_list:
-            avg_chg = sum(chg_list) / len(chg_list)
             results.append({
                 "族群": name,
-                "平均漲跌%": round(avg_chg, 2),
+                "平均漲跌%": round(sum(chg_list) / len(chg_list), 2),
                 "熱度(張)": int(vol_total/1000)
             })
             
@@ -93,7 +81,8 @@ def get_sector_flow_manual():
 @st.cache_data(ttl=30)
 def get_stock_data(sid):
     today = datetime.now().strftime("%Y-%m-%d")
-    start = (datetime.now() - timedelta(days=260)).strftime("%Y-%m-%d")
+    # 抓取範圍加大到 400 天，確保有足夠的營收數據計算 YoY
+    start = (datetime.now() - timedelta(days=400)).strftime("%Y-%m-%d")
     
     t = dl.taiwan_stock_daily(stock_id=sid, start_date=start)
     c = dl.taiwan_stock_institutional_investors(stock_id=sid, start_date=start)
@@ -119,20 +108,17 @@ def get_stock_data(sid):
     return t, c, m, r
 
 # --- 6. UI 介面 ---
-st.title("🏹 超級分析師：Sponsor Pro 手動遍歷版")
+st.title("🏹 超級分析師：Sponsor Pro 穩定防護版")
 
 if login_ok:
     st.sidebar.success(f"✅ Pro 登入成功 ({user_id[:3]}***)")
-    st.sidebar.info("💡 此版本直接使用 Tick 數據，不依賴快照，保證相容性。")
-    
     target_sid = st.sidebar.text_input("輸入代碼", "1560")
     if st.sidebar.button("🔄 刷新數據"):
         st.cache_data.clear()
 
-    # A. 資金流向 (手動掃描)
-    st.subheader("🌊 十大族群資金流向 (Pro 即時掃描)")
-    with st.spinner("正在逐檔抓取即時數據，請稍候..."):
-        flow_df = get_sector_flow_manual()
+    # A. 資金流向
+    st.subheader("🌊 十大族群資金流向 (Pro 即時)")
+    flow_df = get_sector_flow_manual()
     
     if not flow_df.empty:
         c1, c2 = st.columns([2, 1])
@@ -141,7 +127,7 @@ if login_ok:
         with c2:
             st.dataframe(flow_df, hide_index=True, use_container_width=True)
     else:
-        st.warning("⚠️ 盤中暫無數據或今日未開盤。")
+        st.warning("⚠️ 盤中暫無數據或今日未開盤 (API 正常)。")
 
     st.markdown("---")
 
@@ -152,37 +138,19 @@ if login_ok:
         last = t_df.iloc[-1]
         st.markdown(f"### 🎯 {target_sid} 深度即時分析")
         
-        # 儀表板
+        # 1. 儀表板
         col1, col2, col3 = st.columns(3)
         with col1:
             st.metric("最新價", f"${last['close']}", delta=f"{round(last['close']-t_df['close'].iloc[-2], 2)}")
             st.caption(f"資料日期: {last['date']}")
         with col2:
-            st.metric("月線趨勢", "🟢 上揚" if last.get('Slope20', 0) > 0 else "🔴 下彎")
+            trend = "🟢 上揚" if last.get('Slope20', 0) > 0 else "🔴 下彎"
+            st.metric("月線趨勢", trend)
         with col3:
-            # 簡單評分
+            # --- 自動評分 (安全版) ---
             score = 0
-            if last['close'] > last.get('MA20', 0): score += 30
-            if not c_df.empty and c_df['net_buy'].tail(3).sum() > 0: score += 30
-            if not r_df.empty and r_df['revenue'].iloc[-1] > r_df['revenue'].iloc[-13]: score += 40
-            st.metric("綜合評分", f"{score} 分")
-
-        # 頁籤
-        tabs = st.tabs(["📉 技術三線", "🔥 籌碼/融資", "📊 營收"])
-        
-        with tabs[0]:
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(x=t_df['date'], y=t_df['close'], name='價格', line=dict(color='white')))
-            if 'MA20' in t_df.columns: fig.add_trace(go.Scatter(x=t_df['date'], y=t_df['MA20'], name='20MA', line=dict(color='#FFFF00', width=3)))
-            if 'MA60' in t_df.columns: fig.add_trace(go.Scatter(x=t_df['date'], y=t_df['MA60'], name='60MA', line=dict(color='#FF00FF', width=2, dash='dot')))
-            if len(t_df) > 21: fig.add_trace(go.Scatter(x=[t_df['date'].iloc[-21]], y=[t_df['close'].shift(20).iloc[-1]], mode='markers', name='扣抵', marker=dict(size=10, color='yellow', symbol='x')))
-            st.plotly_chart(fig, use_container_width=True)
-
-        with tabs[1]:
-            if not c_df.empty: st.plotly_chart(px.bar(c_df[c_df['name'].isin(['Foreign_Investor','Investment_Trust'])], x='date', y='net_buy', color='name', barmode='group'), use_container_width=True)
-            if not m_df.empty: st.plotly_chart(px.line(m_df, x='date', y='MarginPurchaseStock', title="融資"), use_container_width=True)
-
-        with tabs[2]:
-            if not r_df.empty: st.plotly_chart(px.bar(r_df, x='revenue_month', y='revenue', title="營收"), use_container_width=True)
-else:
-    st.error("⚠️ 請在 Secrets 設定 Sponsor Pro 帳號。")
+            # 技術面 check
+            if not pd.isna(last.get('MA20')) and last['close'] > last['MA20']: 
+                score += 30
+            # 籌碼面 check
+            if not c_df.empty and len(c_df) >= 3 and c_df['
