@@ -41,6 +41,7 @@ THEME_GROUPS = {
     "航運族群": {"industry": [], "stocks": ["2603","2609","2615","2606","2605","2637","2617","5608","2641"]},
     "伺服器族群": {"industry": [], "stocks": ["2382","3231","6669","2356","2317","2324","3706","2376","4938"]},
     "散熱族群": {"industry": [], "stocks": ["3017","3324","3653","2421","3338","6230"]},
+    "面板族群": {"industry": [], "stocks": ["3481","2409","6116","3673"]},
     "金融族群": {"industry": ["金融保險業"], "stocks": ["2881","2882","2891","2886","2884","2885","2880","2887","2892"]},
     "電力重電": {"industry": [], "stocks": ["1519","1513","1503","1504","1514","1609","1617"]},
 }
@@ -725,6 +726,267 @@ def classify_volume_price(price_df: pd.DataFrame, vol_ratio: Optional[float]) ->
     return {"label": "一般波動", "detail": "量價未出現典型突破/出貨訊號，建議搭配趨勢與關鍵價位判讀。"}
 
 
+
+# -----------------------------
+# NEW: 「老王」策略（持股判斷依據）
+# -----------------------------
+def compute_ma(df: pd.DataFrame, n: int) -> pd.Series:
+    s = pd.to_numeric(df["close"], errors="coerce")
+    return s.rolling(n).mean()
+
+
+def compute_volume_ratio_series(df: pd.DataFrame, window: int = 5) -> Optional[pd.Series]:
+    if df is None or df.empty or "Trading_Volume" not in df.columns:
+        return None
+    v = pd.to_numeric(df["Trading_Volume"], errors="coerce")
+    base = v.rolling(window).mean()
+    vr = v / base.replace(0, np.nan)
+    return vr.replace([np.inf, -np.inf], np.nan)
+
+
+def hit_theme(stock_id: str, theme_name: str) -> bool:
+    try:
+        return str(stock_id) in set(str(x) for x in THEME_GROUPS.get(theme_name, {}).get("stocks", []))
+    except Exception:
+        return False
+
+
+def compute_leader_status(market_df: pd.DataFrame, stock_id: str) -> dict:
+    """
+    買強不買弱：判斷該股是否為其族群的領導股（同族群Top3）。
+    使用同族群內：漲跌幅、成交金額、量比的綜合排序。
+    """
+    out = {
+        "industry": "",
+        "is_leader": False,
+        "rank": None,
+        "top_leaders": [],
+    }
+    if market_df is None or market_df.empty:
+        return out
+
+    df = market_df.copy()
+    df["stock_id"] = df["stock_id"].astype(str)
+    df["industry_category"] = df.get("industry_category", "其他").fillna("其他")
+    df["stock_name"] = df.get("stock_name", "").fillna("")
+    df = ensure_change_rate(df)
+
+    row = df[df["stock_id"] == str(stock_id)]
+    if row.empty:
+        return out
+
+    industry = str(row.iloc[0]["industry_category"])
+    out["industry"] = industry
+
+    sub = df[df["industry_category"] == industry].copy()
+    if sub.empty:
+        return out
+
+    money_col = pick_money_col(sub)
+    sub[money_col] = pd.to_numeric(sub[money_col], errors="coerce").fillna(0.0)
+
+    if "volume_ratio" not in sub.columns:
+        sub["volume_ratio"] = 0.0
+    sub["volume_ratio"] = pd.to_numeric(sub["volume_ratio"], errors="coerce").fillna(0.0)
+
+    # 綜合領導分數（可依你的偏好調權重）
+    sub["leader_score"] = (
+        sub["change_rate"].rank(pct=True) * 0.45
+        + sub[money_col].rank(pct=True) * 0.35
+        + sub["volume_ratio"].rank(pct=True) * 0.20
+    )
+
+    sub = sub.sort_values("leader_score", ascending=False).reset_index(drop=True)
+    top3 = sub.head(3)[["stock_id", "stock_name", "change_rate", money_col, "volume_ratio"]].copy()
+    out["top_leaders"] = top3.to_dict("records")
+
+    idx = sub.index[sub["stock_id"] == str(stock_id)]
+    if len(idx):
+        rank = int(idx[0]) + 1
+        out["rank"] = rank
+        out["is_leader"] = rank <= 3
+
+    return out
+
+
+def compute_oldwang_signals(stock_id: str, price_df: pd.DataFrame, profile: str) -> dict:
+    """
+    老王策略檢核：
+      - 均線策略：5/10判斷極短線強弱；20判斷多頭趨勢
+      - 形態：三陽開泰（站上5/10/20）、四海遊龍（站上所有短中期均線）
+      - 量價：突破前高需帶量；大量後不應快速縮量
+      - 一條線策略：大型主流/特定題材（記憶體/面板等）用10MA守線，不破續抱
+      - 無視單一K棒：若未破關鍵支撐，不因單日長黑就判死刑
+    """
+    out = {
+        "ma5": np.nan, "ma10": np.nan, "ma20": np.nan, "ma60": np.nan,
+        "tri": False, "tri_strong": False, "four": False,
+        "key_ma": 10, "key_hold": False, "key_break_2d": False,
+        "breakout_need_volume": False, "post_surge_volume_ok": None,
+        "washout_ignore": False,
+        "notes": [],
+    }
+    if price_df is None or price_df.empty or "close" not in price_df.columns:
+        out["notes"].append("缺少日線資料")
+        return out
+
+    df = price_df.copy()
+    df["close"] = pd.to_numeric(df["close"], errors="coerce")
+    if "Trading_Volume" in df.columns:
+        df["Trading_Volume"] = pd.to_numeric(df["Trading_Volume"], errors="coerce")
+    df = ensure_change_rate(df)
+
+    # MA
+    df["MA5"] = df["close"].rolling(5).mean()
+    df["MA10"] = df["close"].rolling(10).mean()
+    if "MA20" not in df.columns:
+        df["MA20"] = df["close"].rolling(20).mean()
+    if "MA60" not in df.columns:
+        df["MA60"] = df["close"].rolling(60).mean()
+
+    last = df.iloc[-1]
+    out["ma5"] = float(last["MA5"]) if pd.notna(last["MA5"]) else np.nan
+    out["ma10"] = float(last["MA10"]) if pd.notna(last["MA10"]) else np.nan
+    out["ma20"] = float(last["MA20"]) if pd.notna(last["MA20"]) else np.nan
+    out["ma60"] = float(last["MA60"]) if pd.notna(last["MA60"]) else np.nan
+
+    close = float(last["close"]) if pd.notna(last["close"]) else np.nan
+    ma5, ma10, ma20, ma60 = out["ma5"], out["ma10"], out["ma20"], out["ma60"]
+
+    # 三陽開泰 / 四海遊龍
+    if pd.notna(close) and all(pd.notna(x) for x in [ma5, ma10, ma20]):
+        out["tri"] = (close > ma5) and (close > ma10) and (close > ma20)
+        out["tri_strong"] = out["tri"] and (ma5 > ma10 > ma20)
+
+    if pd.notna(close) and all(pd.notna(x) for x in [ma5, ma10, ma20, ma60]):
+        out["four"] = (close > ma5) and (close > ma10) and (close > ma20) and (close > ma60)
+
+    # 一條線策略：預設大型權值股與記憶體/面板主題用 10MA
+    if profile == "大型權值股" or hit_theme(stock_id, "記憶體族群") or hit_theme(stock_id, "面板族群"):
+        out["key_ma"] = 10
+    else:
+        out["key_ma"] = 10
+
+    # keyline hold/break（避免被洗：用「連兩日」才算有效跌破）
+    if len(df) >= 2 and pd.notna(df["MA10"].iloc[-1]) and pd.notna(df["MA10"].iloc[-2]):
+        c1 = float(df["close"].iloc[-1])
+        c2 = float(df["close"].iloc[-2])
+        m1 = float(df["MA10"].iloc[-1])
+        m2 = float(df["MA10"].iloc[-2])
+
+        out["key_hold"] = (c1 >= m1)
+        out["key_break_2d"] = (c1 < m1) and (c2 < m2)
+
+    # 量價：突破前高必須帶量（用20日區間前高 + 相對量）
+    high_col = _get_col(df, ["max", "high"]) or "close"
+    df[high_col] = pd.to_numeric(df[high_col], errors="coerce")
+    prev20_high = df[high_col].rolling(20).max().shift(1).iloc[-1] if len(df) >= 21 else np.nan
+
+    vr = compute_volume_ratio_series(df, window=5)
+    vr_last = float(vr.iloc[-1]) if vr is not None and len(vr) else None
+    vol_confirm = 1.2 if profile == "大型權值股" else 1.5
+
+    if pd.notna(prev20_high) and pd.notna(close) and close > float(prev20_high):
+        out["breakout_need_volume"] = True
+        if vr_last is None or vr_last < vol_confirm:
+            out["notes"].append(f"突破前高但量能未達確認（相對量 {vr_last if vr_last is not None else 'N/A'} < {vol_confirm}）")
+
+    # 大量後不能快速縮量：找近5日是否出現「大量日」，若有，後兩日量比不應掉到過低
+    if vr is not None and len(df) >= 5:
+        recent = df.tail(5).copy()
+        recent_vr = vr.tail(5).reset_index(drop=True)
+        surge_idx = None
+        for i in range(len(recent)-1, -1, -1):
+            chg = float(recent["change_rate"].iloc[i]) if pd.notna(recent["change_rate"].iloc[i]) else 0.0
+            if pd.notna(recent_vr.iloc[i]) and float(recent_vr.iloc[i]) >= 1.8 and chg > 0:
+                surge_idx = i
+                break
+
+        if surge_idx is not None and surge_idx < len(recent)-1:
+            after = recent_vr.iloc[surge_idx+1:]
+            # 若後續量比立刻掉到 <0.7 視為縮量過快（反轉風險）
+            out["post_surge_volume_ok"] = bool((after.dropna() >= 0.7).all()) if len(after.dropna()) else None
+            if out["post_surge_volume_ok"] is False:
+                out["notes"].append("大量後快速縮量（反轉風險提高）")
+
+    # 無視單一K棒：若單日長黑但未破10MA/20MA關鍵支撐，視為洗盤可能
+    if pd.notna(df["change_rate"].iloc[-1]) and float(df["change_rate"].iloc[-1]) <= -3.0:
+        if pd.notna(ma10) and close >= ma10:
+            out["washout_ignore"] = True
+            out["notes"].append("出現長黑但仍守住10MA：偏洗盤，勿因單一K棒翻空")
+
+    # 訊號整理
+    if out["tri_strong"]:
+        out["notes"].append("形態：三陽開泰（強勢版：5>10>20 且站上三均）")
+    elif out["tri"]:
+        out["notes"].append("形態：三陽開泰（站上5/10/20）")
+    if out["four"]:
+        out["notes"].append("形態：四海遊龍（站上短中期均線）")
+    if out["key_break_2d"]:
+        out["notes"].append("一條線策略：連兩日跌破10MA（續抱條件失效）")
+    elif out["key_hold"]:
+        out["notes"].append("一條線策略：守住10MA（可續抱/偏多）")
+
+    return out
+
+
+def compose_oldwang_decision(
+    is_holding: bool,
+    bias_level: str,
+    oldwang: dict,
+    leader: dict,
+    contrarian_flag: bool,
+) -> dict:
+    """
+    產出「持股判斷依據」與建議動作。
+    bias_level: ok/warn/buy/danger/na
+    """
+    action = "等待"
+    reasons = []
+
+    if contrarian_flag:
+        reasons.append("反向警訊：市場/外資過度樂觀（手動標記），短線需防反轉")
+
+    if not leader.get("is_leader", False):
+        rank = leader.get("rank")
+        reasons.append(f"買強不買弱：此股非族群Top3領導股（族群排名 {rank if rank else '-'}），優先關注領導股")
+
+    # 持股模式
+    if is_holding:
+        if oldwang.get("key_break_2d"):
+            action = "減碼/出場"
+            reasons.append("一條線策略失守：連兩日跌破10MA，續抱條件失效")
+        else:
+            if bias_level == "danger":
+                action = "續抱但不加碼"
+                reasons.append("乖離過大：禁止追高；持股以移動停利/不加碼為主")
+            elif oldwang.get("tri") or oldwang.get("four"):
+                action = "續抱/可擇機加碼"
+                reasons.append("站上短均線結構成立，偏多續抱")
+            else:
+                action = "續抱觀察"
+                reasons.append("尚未明確轉空，先守關鍵均線，等待型態明朗")
+    else:
+        # 非持股模式：決定是否可進
+        if bias_level == "danger":
+            action = "不追價，等回測"
+            reasons.append("乖離過大：禁止追高；等待回測均線或整理後再評估")
+        else:
+            if oldwang.get("breakout_need_volume") and any("量能未達" in x for x in oldwang.get("notes", [])):
+                action = "等待量能確認"
+                reasons.append("突破前高但量不足，先等放量確認再介入")
+            elif (oldwang.get("tri") or oldwang.get("four")) and leader.get("is_leader", False):
+                action = "可試單/分批"
+                reasons.append("買強不買弱：領導股 + 多頭型態成立，可試單並嚴守停損")
+            elif oldwang.get("tri") or oldwang.get("four"):
+                action = "小部位試單"
+                reasons.append("多頭型態成立，但若非領導股，建議降低期待或換股")
+            else:
+                action = "等待"
+                reasons.append("型態未成形，等待三陽開泰/四海遊龍或回測承接點")
+
+    return {"action": action, "reasons": reasons}
+
 def build_trade_plan(struct: dict, pattern_info: dict, vol_quality: dict, bias_alert: dict, score: dict) -> dict:
     close = struct.get("close", np.nan)
     ma20 = struct.get("ma20", np.nan)
@@ -1178,6 +1440,308 @@ def get_ai_advice(stock_id: str, stock_info: pd.DataFrame, price_df: pd.DataFram
     return {"profile": profile, "bias_alert": bias_alert, "stance": stance}
 
 
+
+# -----------------------------
+# 10) 老王選股器（基於 5/10/20/60 + 三陽開泰/四海遊龍 + 量價/領導股/守10MA）
+# -----------------------------
+def _is_four_digit_stock_id(s: str) -> bool:
+    s = str(s).strip()
+    return len(s) == 4 and s.isdigit()
+
+def _profile_for_sid(stock_id: str, stock_info: pd.DataFrame) -> str:
+    sid = str(stock_id).strip()
+    if sid in LARGE_CAP_IDS:
+        return "大型權值股"
+    try:
+        row = stock_info[stock_info["stock_id"].astype(str) == sid]
+        if not row.empty:
+            ind = str(row.iloc[-1].get("industry_category", "") or "")
+            if ind == "金融保險業":
+                return "大型權值股"
+    except Exception:
+        pass
+    return "中小型飆股"
+
+def _bias_danger_threshold(profile: str) -> float:
+    return 10.0 if profile == "大型權值股" else 20.0
+
+def _bias_warn_threshold(profile: str) -> float:
+    return 6.0 if profile == "大型權值股" else 15.0
+
+def _vol_confirm_threshold(profile: str) -> float:
+    # 老王：突破要帶量；權值股門檻可低一些
+    return 1.2 if profile == "大型權值股" else 1.5
+
+def _simple_vol_quality(chg_pct: float, vol_ratio: float) -> str:
+    if pd.isna(chg_pct) or pd.isna(vol_ratio):
+        return "N/A"
+    if vol_ratio >= 1.8 and chg_pct > 1:
+        return "放量上漲"
+    if vol_ratio >= 1.5 and abs(chg_pct) < 0.5:
+        return "放量不漲"
+    if vol_ratio >= 1.5 and chg_pct < -1:
+        return "放量下跌"
+    if vol_ratio <= 0.8 and abs(chg_pct) < 1:
+        return "量縮整理"
+    return "一般"
+
+@st.cache_data(ttl=1800)
+def get_multi_stock_price_cached(token: str, stock_ids: list[str], start_date: str) -> pd.DataFrame:
+    """
+    優先嘗試一次抓多檔（若 API 支援 data_id=list），不支援則降級逐檔抓取（僅限候選池）。
+    """
+    if not stock_ids:
+        return pd.DataFrame()
+    # Try multi-id in one call
+    try:
+        df = finmind_get_data(token, dataset="TaiwanStockPrice", data_id=stock_ids, start_date=start_date, timeout=120)
+        df = normalize_date_col(df, "date")
+        if not df.empty and "stock_id" in df.columns:
+            return df
+    except Exception:
+        pass
+
+    # Fallback: per-stock loop
+    frames = []
+    for sid in stock_ids:
+        try:
+            dfi = finmind_get_data(token, dataset="TaiwanStockPrice", data_id=sid, start_date=start_date, timeout=40)
+            if dfi is not None and not dfi.empty:
+                frames.append(dfi)
+        except Exception:
+            continue
+    if not frames:
+        return pd.DataFrame()
+    df = pd.concat(frames, ignore_index=True)
+    return normalize_date_col(df, "date")
+
+def oldwang_screener(
+    token: str,
+    stock_info: pd.DataFrame,
+    vol_rank_today: pd.DataFrame,
+    universe_top_n: int = 300,
+    output_top_k: int = 80,
+    require_leader: bool = True,
+    require_pattern: str = "不限",
+    require_breakout: bool = False,
+    min_money_yi: float = 1.0,
+) -> pd.DataFrame:
+    """
+    依據老王策略做選股：
+      - 5/10/20/月線（20MA）與 60MA
+      - 三陽開泰 / 四海遊龍
+      - 突破前高要帶量
+      - 大量後不能快速縮量（縮量警訊）
+      - 守10MA（避免被洗）
+      - 買強不買弱：族群領導股（以當日成交金額 Top3 代理）
+    """
+    if vol_rank_today is None or vol_rank_today.empty:
+        return pd.DataFrame()
+
+    df0 = vol_rank_today.copy()
+    df0["stock_id"] = df0["stock_id"].astype(str)
+    df0 = df0[df0["stock_id"].apply(_is_four_digit_stock_id)].copy()
+
+    # money col for liquidity gating
+    money_col = pick_money_col(df0)
+    df0[money_col] = pd.to_numeric(df0[money_col], errors="coerce").fillna(0.0)
+
+    # merge names if needed
+    if "stock_name" not in df0.columns or df0["stock_name"].isna().all():
+        info = stock_info[["stock_id", "stock_name", "industry_category"]].drop_duplicates()
+        info["stock_id"] = info["stock_id"].astype(str)
+        df0 = df0.merge(info, on="stock_id", how="left")
+    df0["stock_name"] = df0.get("stock_name", "").fillna("")
+    df0["industry_category"] = df0.get("industry_category", "其他").fillna("其他")
+
+    df0 = ensure_change_rate(df0)
+
+    # liquidity gate
+    min_money = float(min_money_yi) * 1e8
+    df0 = df0[df0[money_col] >= min_money].copy()
+
+    # Universe by liquidity
+    df0 = df0.sort_values(money_col, ascending=False).head(universe_top_n).copy()
+    candidate_ids = df0["stock_id"].tolist()
+
+    # Leader flag by industry (Top3 by money)
+    df0["industry_rank_money"] = df0.groupby("industry_category")[money_col].rank(method="first", ascending=False)
+    df0["is_leader"] = df0["industry_rank_money"] <= 3
+
+    # Fetch history for candidates
+    start_date = (datetime.now(tz=TZ) - timedelta(days=150) if TZ else datetime.now() - timedelta(days=150)).strftime("%Y-%m-%d")
+    hist = get_multi_stock_price_cached(token, candidate_ids, start_date)
+    if hist is None or hist.empty:
+        return pd.DataFrame()
+
+    hist["stock_id"] = hist["stock_id"].astype(str)
+    hist = hist[hist["stock_id"].isin(candidate_ids)].copy()
+    hist = normalize_date_col(hist, "date")
+
+    # Ensure numeric columns
+    for c in ["close", "open", "max", "min", "Trading_Volume", "Trading_money", "spread"]:
+        if c in hist.columns:
+            hist[c] = pd.to_numeric(hist[c], errors="coerce")
+
+    # Compute signals per stock
+    rows = []
+    for sid, g in hist.groupby("stock_id"):
+        g = g.sort_values("date")
+        if len(g) < 65 or g["close"].isna().all():
+            continue
+
+        close = float(g["close"].iloc[-1])
+        ma5 = float(g["close"].rolling(5).mean().iloc[-1])
+        ma10 = float(g["close"].rolling(10).mean().iloc[-1])
+        ma20 = float(g["close"].rolling(20).mean().iloc[-1])
+        ma60 = float(g["close"].rolling(60).mean().iloc[-1])
+
+        bias20 = (close / ma20 - 1) * 100 if pd.notna(ma20) and ma20 != 0 else np.nan
+
+        # 三陽開泰 / 四海遊龍
+        three = pd.notna(ma5) and pd.notna(ma10) and pd.notna(ma20) and close > ma5 and close > ma10 and close > ma20
+        four = three and pd.notna(ma60) and close > ma60
+
+        # 突破20日前高（排除當日）
+        high_col = "max" if "max" in g.columns else "close"
+        prev20_high = float(g[high_col].rolling(20).max().shift(1).iloc[-1])
+        breakout = pd.notna(prev20_high) and close > prev20_high
+
+        # 相對量（今/近5日均量）
+        vol_ratio = np.nan
+        shrink_warn = False
+        if "Trading_Volume" in g.columns and g["Trading_Volume"].notna().sum() >= 10:
+            v = g["Trading_Volume"].copy()
+            v_now = v.iloc[-1]
+            v_base = v.iloc[-6:-1].mean()
+            if pd.notna(v_now) and pd.notna(v_base) and v_base > 0:
+                vol_ratio = float(v_now / v_base)
+
+            # 大量後快速縮量警訊：昨日放量 >= 1.5x 均量、今日 < 0.6*昨日
+            v_y = v.iloc[-2]
+            v_base_y = v.iloc[-7:-2].mean() if len(v) >= 7 else v.iloc[-6:-1].mean()
+            if pd.notna(v_y) and pd.notna(v_base_y) and v_base_y > 0:
+                if (v_y / v_base_y) >= 1.5 and pd.notna(v_now) and v_now < 0.6 * v_y:
+                    shrink_warn = True
+
+        # 守10MA（避免被洗）：連兩日跌破才算失守
+        hold10 = False
+        break10_two_days = False
+        if pd.notna(ma10):
+            if close >= ma10:
+                hold10 = True
+            if len(g) >= 2:
+                c1 = float(g["close"].iloc[-1])
+                c2 = float(g["close"].iloc[-2])
+                ma10_1 = float(g["close"].rolling(10).mean().iloc[-1])
+                ma10_2 = float(g["close"].rolling(10).mean().iloc[-2])
+                break10_two_days = (pd.notna(ma10_1) and pd.notna(ma10_2) and c1 < ma10_1 and c2 < ma10_2)
+
+        # Profile & thresholds
+        profile = _profile_for_sid(sid, stock_info)
+        vol_need = _vol_confirm_threshold(profile)
+        bias_danger = _bias_danger_threshold(profile)
+        bias_warn = _bias_warn_threshold(profile)
+
+        forbid_chase = pd.notna(bias20) and bias20 >= bias_danger
+        bias_state = "OK"
+        if pd.notna(bias20) and bias20 >= bias_danger:
+            bias_state = "DANGER"
+        elif pd.notna(bias20) and bias20 >= bias_warn:
+            bias_state = "WARN"
+
+        vol_ok = (not pd.isna(vol_ratio)) and (vol_ratio >= vol_need)
+        breakout_ok = breakout and vol_ok and (not forbid_chase)
+
+        # Today's info from df0
+        row0 = df0[df0["stock_id"] == sid]
+        if row0.empty:
+            continue
+        row0 = row0.iloc[0]
+        chg = float(row0.get("change_rate", 0.0))
+        money = float(row0.get(money_col, 0.0))
+        leader = bool(row0.get("is_leader", False))
+        industry = str(row0.get("industry_category", "其他") or "其他")
+        name = str(row0.get("stock_name", "") or "")
+
+        # 老王核心：買強不買弱（需要領導股）
+        if require_leader and not leader:
+            pass_filter_leader = False
+        else:
+            pass_filter_leader = True
+
+        # Pattern filter
+        pass_pattern = True
+        if require_pattern == "三陽開泰":
+            pass_pattern = three
+        elif require_pattern == "四海遊龍":
+            pass_pattern = four
+
+        # Breakout filter
+        pass_breakout = True
+        if require_breakout:
+            pass_breakout = breakout_ok
+
+        if not (pass_filter_leader and pass_pattern and pass_breakout):
+            continue
+
+        # Vol quality label
+        vq = _simple_vol_quality(chg, vol_ratio) if not pd.isna(vol_ratio) else "N/A"
+
+        # Score (老王偏好：領導 + 型態 + 帶量突破 + 守10MA；縮量/過熱扣分)
+        s = 0
+        s += 20 if leader else 0
+        s += 25 if four else (15 if three else 0)
+        s += 25 if breakout_ok else (10 if breakout and vol_ok else 0)
+        s += 10 if hold10 else 0
+        s -= 12 if shrink_warn else 0
+        s -= 20 if forbid_chase else 0
+        s += 5 if vq == "放量上漲" else 0
+        s = int(max(0, min(100, s)))
+
+        reasons = []
+        if leader: reasons.append("族群領導股")
+        if four: reasons.append("四海遊龍")
+        elif three: reasons.append("三陽開泰")
+        if breakout: reasons.append("突破前高")
+        if vol_ok: reasons.append("帶量")
+        if shrink_warn: reasons.append("縮量警訊")
+        if forbid_chase: reasons.append("乖離過大")
+        if break10_two_days: reasons.append("連兩日破10MA")
+
+        rows.append({
+            "代碼": sid,
+            "名稱": name,
+            "產業": industry,
+            "漲跌幅(%)": round(chg, 2),
+            "成交金額(億)": round(money / 1e8, 2),
+            "相對量": round(vol_ratio, 2) if not pd.isna(vol_ratio) else np.nan,
+            "MA5": round(ma5, 2),
+            "MA10": round(ma10, 2),
+            "MA20": round(ma20, 2),
+            "MA60": round(ma60, 2),
+            "BIAS20(%)": round(bias20, 2) if not pd.isna(bias20) else np.nan,
+            "三陽開泰": bool(three),
+            "四海遊龍": bool(four),
+            "突破20前高": bool(breakout),
+            "突破帶量": bool(breakout_ok),
+            "守10MA": bool(hold10),
+            "連兩日破10MA": bool(break10_two_days),
+            "領導股": bool(leader),
+            "量價品質": vq,
+            "Bias狀態": bias_state,
+            "縮量警訊": bool(shrink_warn),
+            "老王分數": s,
+            "理由": " / ".join(reasons) if reasons else "",
+        })
+
+    if not rows:
+        return pd.DataFrame()
+
+    out = pd.DataFrame(rows).sort_values(["老王分數", "成交金額(億)"], ascending=[False, False]).head(output_top_k).reset_index(drop=True)
+    out.insert(0, "Rank", range(1, len(out) + 1))
+    return out
+
 # -----------------------------
 # Orchestrator
 # -----------------------------
@@ -1190,6 +1754,8 @@ def run_all_features(
     theme_top_k: int,
     theme_money_threshold_yi: float,
     bias_profile_mode: str,
+    is_holding: bool,
+    contrarian_flag: bool,
 ) -> dict:
     res: dict = {"stock_id": stock_id, "scan_mode": scan_mode, "ts": datetime.utcnow().isoformat()}
 
@@ -1296,7 +1862,50 @@ def run_all_features(
     vol_quality = classify_volume_price(res["price_df"], vol_ratio)
     plan = build_trade_plan(struct, pattern_info, vol_quality, ai.get("bias_alert", {}), score)
 
+    # 老王策略：領導股判斷 + 形態/一條線/量價檢核（寫入持股判斷依據）
+    leader = compute_leader_status(vol_rank, stock_id)
+    oldwang = compute_oldwang_signals(stock_id, res["price_df"], profile)
+    decision = compose_oldwang_decision(
+        is_holding=is_holding,
+        bias_level=(ai.get("bias_alert", {}) or {}).get("level", "na"),
+        oldwang=oldwang,
+        leader=leader,
+        contrarian_flag=contrarian_flag,
+    )
+
+    # 把老王檢核寫入交易計畫文字（附加段落）
+    add_lines = []
+    add_lines.append("")
+    add_lines.append("——")
+    add_lines.append("老王策略檢核（持股判斷依據）")
+    add_lines.append(f"- 建議動作：**{decision['action']}**")
+    for r in decision["reasons"][:6]:
+        add_lines.append(f"- {r}")
+    # 顯示族群領導股清單（前3）
+    if leader.get("top_leaders"):
+        add_lines.append("- 族群Top3領導股：")
+        for it in leader["top_leaders"]:
+            sid = it.get("stock_id", "")
+            nm = it.get("stock_name", "")
+            chg = it.get("change_rate", np.nan)
+            add_lines.append(f"  - {sid} {nm}（{chg:.2f}%）")
+    # 形態訊號
+    if oldwang.get("notes"):
+        add_lines.append("- 訊號：")
+        for n in oldwang["notes"][:8]:
+            add_lines.append(f"  - {n}")
+
+    plan["summary"] = plan.get("summary", "") + "\n" + "\n".join(add_lines)
+    plan["oldwang_action"] = decision["action"]
+    plan["oldwang_reasons"] = decision["reasons"]
+    
+
     res["trade_engine"] = {
+
+        "leader": leader,
+        "oldwang": oldwang,
+        "decision": decision,
+
         "profile": profile,
         "vol_ratio": vol_ratio,
         "structure": struct,
@@ -1325,6 +1934,10 @@ st.sidebar.divider()
 st.sidebar.subheader("乖離率警報")
 bias_profile_mode = st.sidebar.selectbox("股票屬性（影響乖離警戒線）", options=["自動判斷", "大型權值股", "中小型飆股"], index=0)
 
+st.sidebar.checkbox("我已持有此股（持股模式）", value=False, key="is_holding")
+st.sidebar.checkbox("反向警訊：外資/市場過度樂觀（手動）", value=False, key="contrarian_flag")
+
+
 st.sidebar.divider()
 st.sidebar.subheader("十大族群代表股")
 sector_pick_k = st.sidebar.slider("每族群挑幾檔", 3, 12, 5, 1)
@@ -1351,6 +1964,8 @@ if st.sidebar.button("一鍵更新（含交易計畫引擎）"):
             theme_top_k=theme_top_k,
             theme_money_threshold_yi=theme_money_threshold_yi,
             bias_profile_mode=bias_profile_mode,
+            is_holding=st.session_state.get("is_holding", False),
+            contrarian_flag=st.session_state.get("contrarian_flag", False),
         )
     st.sidebar.success("更新完成")
 
@@ -1358,8 +1973,8 @@ if st.sidebar.button("清除結果"):
     st.session_state["result"] = None
     st.sidebar.info("已清除")
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
-    ["1. 健診/技術圖", "2. 十大族群資金流向", "3. 全台股相對大量榜", "4. 籌碼照妖鏡", "5. 營收診斷", "8. 主題族群雷達", "9. 交易計畫引擎"]
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs(
+    ["1. 健診/技術圖", "2. 十大族群資金流向", "3. 全台股相對大量榜", "4. 籌碼照妖鏡", "5. 營收診斷", "8. 主題族群雷達", "9. 交易計畫引擎", "10. 老王選股器"]
 )
 
 res = st.session_state.get("result")
@@ -1652,6 +2267,39 @@ with tab7:
             # Plan text
             st.markdown(plan.get("summary", ""))
 
+            st.markdown("### 老王策略檢核（結構化）")
+            ow = te.get("oldwang", {})
+            ld = te.get("leader", {})
+            dc = te.get("decision", {})
+            cA, cB = st.columns(2)
+            cA.metric("建議動作", dc.get("action", "-"))
+            cB.metric("是否族群領導股", "是" if ld.get("is_leader") else "否")
+
+            if ld.get("industry"):
+                st.caption(f"族群：{ld.get('industry')}；族群排名：{ld.get('rank') if ld.get('rank') else '-'}")
+            if ld.get("top_leaders"):
+                st.write("族群Top3領導股：")
+                st.dataframe(pd.DataFrame(ld["top_leaders"]), use_container_width=True)
+
+            # 形態/守線訊號
+            sig_rows = [{
+                "三陽開泰": ow.get("tri"),
+                "三陽開泰(強)": ow.get("tri_strong"),
+                "四海遊龍": ow.get("four"),
+                "守住10MA": ow.get("key_hold"),
+                "連兩日破10MA": ow.get("key_break_2d"),
+                "突破需帶量": ow.get("breakout_need_volume"),
+                "大量後不縮量": ow.get("post_surge_volume_ok"),
+                "長黑洗盤提示": ow.get("washout_ignore"),
+            }]
+            st.dataframe(pd.DataFrame(sig_rows), use_container_width=True)
+
+            if dc.get("reasons"):
+                st.write("依據：")
+                for r in dc["reasons"]:
+                    st.write(f"- {r}")
+
+
             # Key levels
             st.markdown("### 關鍵價位")
             sup = plan.get("supports", [])
@@ -1668,3 +2316,68 @@ with tab7:
             n1.metric("停損參考", "-" if stop is None else f"{stop:.2f}")
             n2.metric("目標1", "-" if t1 is None else f"{t1:.2f}")
             n3.metric("目標2", "-" if t2 is None else f"{t2:.2f}")
+
+# -----------------------------
+# Tab 8
+# -----------------------------
+with tab8:
+    st.subheader("老王選股器（5/10/20/60 + 三陽開泰/四海遊龍 + 帶量突破 + 守10MA + 領導股）")
+
+    if res is None:
+        st.info("請先按左側「一鍵更新（含交易計畫引擎）」，取得全市場掃描資料後再跑選股器。")
+    else:
+        vol_rank = res.get("volume_rank", pd.DataFrame())
+        sector_flow = res.get("sector_flow", pd.DataFrame())
+        meta = res.get("market_meta", {})
+
+        st.caption(f"資料來源：{meta.get('source','')}；掃描日期：{meta.get('scan_date','')}")
+
+        c1, c2, c3, c4 = st.columns(4)
+        universe_top_n = c1.number_input("候選池（依成交金額前 N）", min_value=50, max_value=800, value=300, step=50)
+        output_top_k = c2.number_input("輸出 Top K", min_value=20, max_value=200, value=80, step=10)
+        min_money_yi = c3.number_input("成交金額門檻（億）", min_value=0.0, max_value=50.0, value=1.0, step=0.5)
+        require_leader = c4.checkbox("只挑族群領導股（Top3）", value=True)
+
+        c5, c6 = st.columns(2)
+        require_pattern = c5.selectbox("型態過濾", ["不限", "三陽開泰", "四海遊龍"], index=0)
+        require_breakout = c6.checkbox("只挑『突破前高且帶量』", value=False)
+
+        run_btn = st.button("🚀 執行老王選股器", type="primary")
+
+        if "oldwang_screener_df" not in st.session_state:
+            st.session_state["oldwang_screener_df"] = pd.DataFrame()
+
+        if run_btn:
+            if vol_rank is None or vol_rank.empty:
+                st.error("全市場資料為空，無法選股。請確認掃描來源是否可回傳資料。")
+            else:
+                with st.spinner("選股器運算中（抓取候選股近 60+ 日資料並計算訊號）..."):
+                    df_pick = oldwang_screener(
+                        token=token,
+                        stock_info=stock_info,
+                        vol_rank_today=vol_rank,
+                        universe_top_n=int(universe_top_n),
+                        output_top_k=int(output_top_k),
+                        require_leader=bool(require_leader),
+                        require_pattern=str(require_pattern),
+                        require_breakout=bool(require_breakout),
+                        min_money_yi=float(min_money_yi),
+                    )
+                st.session_state["oldwang_screener_df"] = df_pick
+
+        df_pick = st.session_state.get("oldwang_screener_df", pd.DataFrame())
+        if df_pick is None or df_pick.empty:
+            st.info("尚未執行選股器，或本次條件下沒有符合的股票。")
+        else:
+            st.markdown("### 選股結果（老王分數越高越符合策略）")
+            st.dataframe(df_pick, use_container_width=True)
+
+            # quick summary counts
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("結果數量", len(df_pick))
+            k2.metric("四海遊龍", int(df_pick["四海遊龍"].sum()) if "四海遊龍" in df_pick.columns else 0)
+            k3.metric("突破帶量", int(df_pick["突破帶量"].sum()) if "突破帶量" in df_pick.columns else 0)
+            k4.metric("縮量警訊", int(df_pick["縮量警訊"].sum()) if "縮量警訊" in df_pick.columns else 0)
+
+            csv = df_pick.to_csv(index=False).encode("utf-8-sig")
+            st.download_button("下載 CSV", data=csv, file_name="oldwang_screener.csv", mime="text/csv")
