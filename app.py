@@ -191,10 +191,32 @@ def _get_col(df: pd.DataFrame, candidates: list[str]) -> Optional[str]:
 # Market framework: TAIEX vs OTC (divergence)
 # -----------------------------
 def _detect_market_col(info: pd.DataFrame) -> Optional[str]:
-    for c in ["type", "market", "exchange", "stock_type", "market_type", "stock_market"]:
-        if c in info.columns:
-            return c
-    return None
+    # Pick the best market/exchange column from TaiwanStockInfo.
+    # Avoid accidentally choosing generic columns that are not TSE/OTC.
+    candidates = ["market", "exchange", "market_type", "stock_market", "type", "stock_type"]
+    cols = [c for c in candidates if c in info.columns]
+    if not cols:
+        return None
+
+    best_col = None
+    best_score = -1
+    sample = info[cols].drop_duplicates().head(5000).copy()
+
+    for c in cols:
+        try:
+            mapped = sample[c].apply(_normalize_market_value)
+            ct_tse = int((mapped == "TSE").sum())
+            ct_otc = int((mapped == "OTC").sum())
+            score = min(ct_tse, ct_otc) * 100 + (ct_tse + ct_otc)
+            if score > best_score:
+                best_score = score
+                best_col = c
+        except Exception:
+            continue
+
+    if best_score <= 0:
+        return None
+    return best_col
 
 
 def _normalize_market_value(v: str) -> Optional[str]:
@@ -2021,9 +2043,10 @@ def oldwang_screener(
     df0 = df0.sort_values(money_col, ascending=False).head(int(universe_top_n)).copy()
 
     # --- 市場篩選（上市/上櫃）---
-    # 依 TaiwanStockInfo 的市場欄位做篩選；若無該欄位則忽略篩選（避免選股器報錯）
+    # 依 TaiwanStockInfo 的市場欄位做篩選；若無該欄位或篩完為空，會自動回退到不篩選（避免結果整片空白）
     if market_filter in ["TSE", "OTC"]:
         try:
+            _df0_backup = df0.copy()
             mcol = _detect_market_col(stock_info)
             if mcol is not None:
                 info_m = stock_info[["stock_id", mcol]].drop_duplicates().copy()
@@ -2032,6 +2055,8 @@ def oldwang_screener(
                 df0 = df0.merge(info_m[["stock_id", "_m"]], on="stock_id", how="left")
                 df0 = df0[df0["_m"] == market_filter].copy()
                 df0 = df0.drop(columns=["_m"], errors="ignore")
+                if df0.empty:
+                    df0 = _df0_backup
         except Exception:
             pass
 
@@ -3225,6 +3250,7 @@ with tab6:
         rs_bonus_weight = st.slider("RS 加分權重（加分項）", min_value=0, max_value=10, value=6, step=1)
         market_filter_ui = st.selectbox("市場篩選", options=["全部", "上市(TSE)", "上櫃(OTC)"], index=0)
         startup_mode_ui = st.selectbox("起漲模式", options=["自訂", "起漲-拉回承接", "起漲-突破發動", "趨勢-四海遊龍續漲"], index=0)
+        st.caption("市場篩選：若資料源無法辨識上市/上櫃欄位，系統會自動回退為不篩選（避免結果為空）。")
         min_money_yi = c3.number_input("成交金額門檻（億）", min_value=0.0, max_value=50.0, value=1.0, step=0.5)
         require_leader = c4.checkbox("只挑族群領導股（Top3）", value=True)
 
