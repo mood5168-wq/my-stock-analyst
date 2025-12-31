@@ -191,8 +191,8 @@ def _get_col(df: pd.DataFrame, candidates: list[str]) -> Optional[str]:
 # Market framework: TAIEX vs OTC (divergence)
 # -----------------------------
 def _detect_market_col(info: pd.DataFrame) -> Optional[str]:
-    # Pick the best market/exchange column from TaiwanStockInfo.
-    # Avoid accidentally choosing generic columns that are not TSE/OTC.
+    # Choose the most plausible market/exchange column from TaiwanStockInfo.
+    # Score columns by how well they map to BOTH TSE and OTC.
     candidates = ["market", "exchange", "market_type", "stock_market", "type", "stock_type"]
     cols = [c for c in candidates if c in info.columns]
     if not cols:
@@ -218,10 +218,51 @@ def _detect_market_col(info: pd.DataFrame) -> Optional[str]:
         return None
     return best_col
 
+    best_col = None
+    best_score = -1
+    sample = info[cols].drop_duplicates().head(5000).copy()
+
+    for c in cols:
+        try:
+            mapped = sample[c].apply(_normalize_market_value)
+            ct_tse = int((mapped == "TSE").sum())
+            ct_otc = int((mapped == "OTC").sum())
+            score = min(ct_tse, ct_otc) * 100 + (ct_tse + ct_otc)
+            if score > best_score:
+                best_score = score
+                best_col = c
+        except Exception:
+            continue
+
+    if best_score <= 0:
+        return None
+    return best_col
+
 
 def _normalize_market_value(v: str) -> Optional[str]:
     if v is None:
         return None
+    s = str(v).strip().lower()
+
+    # English exchange codes
+    if "tpex" in s or "otc" in s:
+        return "OTC"
+    if "twse" in s or "tse" in s:
+        return "TSE"
+
+    # Chinese labels
+    if "上櫃" in s or "上柜" in s or "櫃買" in s or "柜买" in s:
+        return "OTC"
+    if "上市" in s:
+        return "TSE"
+
+    # Short / numeric codes seen in some datasets
+    if s in {"2", "otc"}:
+        return "OTC"
+    if s in {"1", "tse"}:
+        return "TSE"
+
+    return None
     s = str(v).strip().lower()
     if "otc" in s or "上櫃" in s or "柜" in s:
         return "OTC"
@@ -1986,6 +2027,7 @@ def oldwang_screener(
     rs_window: int = 20,
     rs_bonus_weight: int = 6,
     market_filter: str = "ALL",  # ALL / TSE / OTC
+    strict_market: bool = True,
 ) -> pd.DataFrame:
     """
     依據老王策略做選股（全市場掃描）：
@@ -2042,21 +2084,29 @@ def oldwang_screener(
     # Universe by money
     df0 = df0.sort_values(money_col, ascending=False).head(int(universe_top_n)).copy()
 
-    # --- 市場篩選（上市/上櫃）---
-    # 依 TaiwanStockInfo 的市場欄位做篩選；若無該欄位或篩完為空，會自動回退到不篩選（避免結果整片空白）
+        # --- 市場篩選（上市/上櫃）---
+    # 依 TaiwanStockInfo 的市場欄位做篩選；若無該欄位則略過。
+    # strict_market=True：不回退（篩完為空就維持空，讓你知道市場辨識失敗或條件太嚴）
+    market_debug = {"mcol": None, "tse": 0, "otc": 0, "unknown": 0, "after_filter": None, "applied": False}
+
     if market_filter in ["TSE", "OTC"]:
         try:
-            _df0_backup = df0.copy()
             mcol = _detect_market_col(stock_info)
+            market_debug["mcol"] = mcol
             if mcol is not None:
                 info_m = stock_info[["stock_id", mcol]].drop_duplicates().copy()
                 info_m["stock_id"] = info_m["stock_id"].astype(str)
                 info_m["_m"] = info_m[mcol].apply(_normalize_market_value)
+
+                market_debug["tse"] = int((info_m["_m"] == "TSE").sum())
+                market_debug["otc"] = int((info_m["_m"] == "OTC").sum())
+                market_debug["unknown"] = int(info_m["_m"].isna().sum())
+
                 df0 = df0.merge(info_m[["stock_id", "_m"]], on="stock_id", how="left")
                 df0 = df0[df0["_m"] == market_filter].copy()
                 df0 = df0.drop(columns=["_m"], errors="ignore")
-                if df0.empty:
-                    df0 = _df0_backup
+                market_debug["after_filter"] = int(len(df0))
+                market_debug["applied"] = True
         except Exception:
             pass
 
@@ -3249,6 +3299,8 @@ with tab6:
         output_top_k = c2.number_input("輸出 Top K", min_value=20, max_value=200, value=80, step=10)
         rs_bonus_weight = st.slider("RS 加分權重（加分項）", min_value=0, max_value=10, value=6, step=1)
         market_filter_ui = st.selectbox("市場篩選", options=["全部", "上市(TSE)", "上櫃(OTC)"], index=0)
+        strict_market_ui = st.checkbox("嚴格市場篩選（不回退）", value=True)
+        debug_market_ui = st.checkbox("顯示市場篩選診斷", value=False)
         startup_mode_ui = st.selectbox("起漲模式", options=["自訂", "起漲-拉回承接", "起漲-突破發動", "趨勢-四海遊龍續漲"], index=0)
         st.caption("市場篩選：若資料源無法辨識上市/上櫃欄位，系統會自動回退為不篩選（避免結果為空）。")
         min_money_yi = c3.number_input("成交金額門檻（億）", min_value=0.0, max_value=50.0, value=1.0, step=0.5)
@@ -3289,8 +3341,21 @@ with tab6:
                         rs_window=20,
                         rs_proxy_id='0050',
                         market_filter=market_filter,
+                        strict_market=bool(strict_market_ui) if 'strict_market_ui' in locals() else True,
                         startup_mode=str(startup_mode_ui) if 'startup_mode_ui' in locals() else '自訂',
                     )
+
+                    if 'debug_market_ui' in locals() and debug_market_ui:
+                        with st.expander("市場篩選診斷（上市/上櫃辨識）", expanded=True):
+                            mcol = _detect_market_col(stock_info)
+                            st.write("偵測到的市場欄位：", mcol if mcol else "（未偵測到）")
+                            if mcol:
+                                info_m = stock_info[["stock_id", mcol]].drop_duplicates().copy()
+                                info_m["_m"] = info_m[mcol].apply(_normalize_market_value)
+                                st.write("映射統計：TSE", int((info_m["_m"]=="TSE").sum()), "OTC", int((info_m["_m"]=="OTC").sum()), "Unknown", int(info_m["_m"].isna().sum()))
+                                st.write("原始值樣本（去重前20筆）：")
+                                st.dataframe(info_m[[mcol]].drop_duplicates().head(20), use_container_width=True)
+                            st.write("若 Unknown 很高，代表 TaiwanStockInfo 的欄位內容不是上市/上櫃代碼，需調整映射規則。")
                 st.session_state["oldwang_screener_df"] = df_pick
 
         df_pick = st.session_state.get("oldwang_screener_df", pd.DataFrame())
