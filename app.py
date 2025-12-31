@@ -2028,6 +2028,7 @@ def oldwang_screener(
     rs_bonus_weight: int = 6,
     market_filter: str = "ALL",  # ALL / TSE / OTC
     strict_market: bool = True,
+    new_complete_filter: str = "不限",  # 不限 / 今日新三陽 / 今日新三陽(強) / 今日新四海
 ) -> pd.DataFrame:
     """
     依據老王策略做選股（全市場掃描）：
@@ -2282,6 +2283,45 @@ def oldwang_screener(
             hold10_two = False
         three_strong = bool(three and pd.notna(ma5) and pd.notna(ma10) and pd.notna(ma20) and (ma5 > ma10 > ma20) and (pd.isna(ma20_slope) or ma20_slope >= 0 or hold10_two))
 
+        # 今日新成立：昨天未成立、今天才成立（抓起漲股）
+        new_three = False
+        new_three_strong = False
+        new_four = False
+        try:
+            if len(g) >= 61:
+                prev_close = float(g["close"].iloc[-2])
+                prev_ma5 = float(g["MA5"].iloc[-2]) if pd.notna(g["MA5"].iloc[-2]) else np.nan
+                prev_ma10 = float(g["MA10"].iloc[-2]) if pd.notna(g["MA10"].iloc[-2]) else np.nan
+                prev_ma20 = float(g["MA20"].iloc[-2]) if pd.notna(g["MA20"].iloc[-2]) else np.nan
+                prev_ma60 = float(g["MA60"].iloc[-2]) if pd.notna(g["MA60"].iloc[-2]) else np.nan
+
+                three_prev = pd.notna(prev_ma5) and pd.notna(prev_ma10) and pd.notna(prev_ma20) and prev_close >= prev_ma5 and prev_close >= prev_ma10 and prev_close >= prev_ma20
+                four_prev = bool(three_prev and pd.notna(prev_ma60) and prev_close >= prev_ma60)
+
+                # 三陽強（昨日）判斷（用昨日均線排列 + MA20翻揚或10MA連兩日守住）
+                prev_three_strong = False
+                try:
+                    prev_ma20_slope = np.nan
+                    if len(g) >= 66:
+                        prev_ma20_slope = float(g["MA20"].iloc[-2] - g["MA20"].iloc[-7])
+                    prev_hold10_two = False
+                    if len(g) >= 3 and pd.notna(prev_ma10):
+                        prev_hold10_two = bool(g["close"].iloc[-2] >= g["MA10"].iloc[-2] and g["close"].iloc[-3] >= g["MA10"].iloc[-3])
+                    prev_three_strong = bool(
+                        three_prev and pd.notna(prev_ma5) and pd.notna(prev_ma10) and pd.notna(prev_ma20)
+                        and (prev_ma5 > prev_ma10 > prev_ma20)
+                        and (pd.isna(prev_ma20_slope) or prev_ma20_slope >= 0 or prev_hold10_two)
+                    )
+                except Exception:
+                    prev_three_strong = False
+
+                new_three = bool(three and (not three_prev))
+                new_four = bool(four and (not four_prev))
+                new_three_strong = bool(three_strong and (not prev_three_strong))
+        except Exception:
+            pass
+
+
 
         # Breakout: close > prev 20-day high (exclude today)
         high_col = "max" if "max" in g.columns else "close"
@@ -2351,13 +2391,23 @@ def oldwang_screener(
                 pass_filter_pattern = bool(three_strong and (bias_state != "DANGER"))
                 startup_tag = "起漲-拉回承接"
             elif startup_mode == "起漲-突破發動":
-                pass_filter_pattern = bool(breakout_ok and (bias_state != "DANGER"))
+                pass_filter_pattern = bool(breakout_ok and three and (bias_state != "DANGER"))
                 startup_tag = "起漲-突破發動"
             elif startup_mode == "趨勢-四海遊龍續漲":
                 pass_filter_pattern = bool(four and (bias_state != "DANGER"))
                 startup_tag = "趨勢-四海遊龍續漲"
             else:
                 startup_tag = "自訂"
+
+
+        # 今日新成立過濾（抓「今天剛成立」的三陽/四海）
+        pass_filter_new = True
+        if new_complete_filter == "今日新三陽":
+            pass_filter_new = bool(new_three)
+        elif new_complete_filter == "今日新三陽(強)":
+            pass_filter_new = bool(new_three_strong)
+        elif new_complete_filter == "今日新四海":
+            pass_filter_new = bool(new_four)
 
         if require_pattern == "三陽開泰":
             pass_filter_pattern = bool(three)
@@ -2369,7 +2419,7 @@ def oldwang_screener(
 
         pass_filter_breakout = (not require_breakout) or breakout_ok
 
-        if not (pass_filter_leader and pass_filter_pattern and pass_filter_breakout):
+        if not (pass_filter_leader and pass_filter_pattern and pass_filter_breakout and pass_filter_new):
             continue
 
         # 量價型態（快速標籤）
@@ -2456,7 +2506,7 @@ def oldwang_screener(
         # --- startup_mode bonus（加分項）---
         if startup_tag == "起漲-拉回承接" and three_strong:
             s += 4
-        elif startup_tag == "起漲-突破發動" and breakout_ok:
+        elif startup_tag == "起漲-突破發動" and breakout_ok and three:
             s += 5
         elif startup_tag == "趨勢-四海遊龍續漲" and four and hold10:
             s += 4
@@ -2476,6 +2526,7 @@ def oldwang_screener(
             "BIAS20(%)": round(bias20, 2) if pd.notna(bias20) else np.nan,
             "股性": profile,
             "起漲型態": startup_tag,
+            "突破發動需三陽": True,
             "三陽開泰(強)": bool(three_strong),
             "主題標記": " / ".join(sorted(list(theme_tag_map.get(sid, set())))) if isinstance(theme_tag_map, dict) else "",
             "三陽開泰": bool(three),
@@ -3302,6 +3353,7 @@ with tab6:
         strict_market_ui = st.checkbox("嚴格市場篩選（不回退）", value=True)
         debug_market_ui = st.checkbox("顯示市場篩選診斷", value=False)
         startup_mode_ui = st.selectbox("起漲模式", options=["自訂", "起漲-拉回承接", "起漲-突破發動", "趨勢-四海遊龍續漲"], index=0)
+        new_complete_ui = st.selectbox("今日新成立過濾", options=["不限", "今日新三陽", "今日新三陽(強)", "今日新四海"], index=0)
         st.caption("市場篩選：若資料源無法辨識上市/上櫃欄位，系統會自動回退為不篩選（避免結果為空）。")
         min_money_yi = c3.number_input("成交金額門檻（億）", min_value=0.0, max_value=50.0, value=1.0, step=0.5)
         require_leader = c4.checkbox("只挑族群領導股（Top3）", value=True)
@@ -3343,6 +3395,7 @@ with tab6:
                         market_filter=market_filter,
                         strict_market=bool(strict_market_ui) if 'strict_market_ui' in locals() else True,
                         startup_mode=str(startup_mode_ui) if 'startup_mode_ui' in locals() else '自訂',
+                        new_complete_filter=str(new_complete_ui) if 'new_complete_ui' in locals() else '不限',
                     )
 
                     if 'debug_market_ui' in locals() and debug_market_ui:
