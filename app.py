@@ -3,11 +3,17 @@ from datetime import datetime, timedelta
 from typing import Optional, Union, Iterable
 
 import numpy as np
+import re
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import requests
+import xml.etree.ElementTree as ET
 import streamlit as st
+
+from pathlib import Path
+import io
+import os
 
 # -----------------------------
 # Streamlit config
@@ -370,10 +376,554 @@ def build_divergence_hint(tw: dict, oc: dict, breadth: dict) -> dict:
 
     return {"level": "success", "title": "大小盤同步", "detail": "加權與櫃買趨勢方向一致，盤勢一致性較佳。"}
 
+
+# -----------------------------
+# TDCC 股權分散：散戶(1-10張) vs 大戶(>=100/500/1000張)（每週）
+# -----------------------------
+LOT = 1000
+RETAIL_LOW = 1 * LOT
+RETAIL_HIGH = 10 * LOT
+BIG_100 = 100 * LOT
+BIG_500 = 500 * LOT
+BIG_1000 = 1000 * LOT
+
+def _parse_level_range(level: str):
+    """
+    Parse HoldingSharesLevel to (lower, upper) in shares.
+    Examples:
+      '1-999'
+      '1,000-5,000'
+      '1,000,001-999,999,999'
+      '1,000,001以上'
+    """
+    if level is None:
+        return (np.nan, np.nan)
+    s = str(level).strip()
+
+    # '以上'
+    if "以上" in s:
+        m = re.search(r"[\d,]+", s)
+        if not m:
+            return (np.nan, np.nan)
+        lo = float(m.group(0).replace(",", ""))
+        return (lo, float("inf"))
+
+    nums = re.findall(r"[\d,]+", s)
+    if len(nums) >= 2:
+        lo = float(nums[0].replace(",", ""))
+        hi = float(nums[1].replace(",", ""))
+        return (lo, hi)
+    if len(nums) == 1:
+        lo = float(nums[0].replace(",", ""))
+        return (lo, lo)
+    return (np.nan, np.nan)
+
+@st.cache_data(ttl=24 * 3600)
+def get_holding_shares_per_cached(token: str, stock_id: str, start_date: str) -> pd.DataFrame:
+    df = finmind_get_data(
+        token,
+        dataset="TaiwanStockHoldingSharesPer",
+        data_id=stock_id,
+        start_date=start_date,
+        timeout=40,
+    )
+    if df is None or df.empty:
+        return pd.DataFrame()
+    df = df.copy()
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
+    return df
+
+def build_retail_big_weekly(token: str, stock_id: str, start_date: str = "2019-01-01") -> pd.DataFrame:
+    """
+    Weekly holding structure:
+      retail: 1-10 lots (1,000-10,000 shares)
+      big: >=100/500/1000 lots (>=100k/500k/1M shares)
+    Returns percent/people and WoW diffs.
+    """
+    df = get_holding_shares_per_cached(token, stock_id, start_date)
+    if df is None or df.empty or "HoldingSharesLevel" not in df.columns:
+        return pd.DataFrame()
+
+    d = df.copy()
+    d[["lo", "hi"]] = d["HoldingSharesLevel"].apply(lambda x: pd.Series(_parse_level_range(x)))
+    for c in ["people", "percent", "shares"]:
+        if c in d.columns:
+            d[c] = pd.to_numeric(d[c], errors="coerce")
+
+    retail = d[(d["lo"] >= RETAIL_LOW) & (d["hi"] <= RETAIL_HIGH)].copy()
+    big100 = d[d["lo"] >= BIG_100].copy()
+    big500 = d[d["lo"] >= BIG_500].copy()
+    big1000 = d[d["lo"] >= BIG_1000].copy()
+
+    def _agg(x: pd.DataFrame, prefix: str) -> pd.DataFrame:
+        if x.empty:
+            return pd.DataFrame(columns=["date", f"{prefix}_people", f"{prefix}_percent"])
+        g = x.groupby("date", as_index=False).agg(
+            people=("people", "sum"),
+            percent=("percent", "sum"),
+        )
+        return g.rename(columns={"people": f"{prefix}_people", "percent": f"{prefix}_percent"})
+
+    out = _agg(retail, "retail_1_10")
+    for pref, chunk in [("big_100", big100), ("big_500", big500), ("big_1000", big1000)]:
+        out = out.merge(_agg(chunk, pref), on="date", how="outer")
+
+    out = out.sort_values("date").reset_index(drop=True)
+
+    # WoW changes
+    for pref in ["retail_1_10", "big_100", "big_500", "big_1000"]:
+        if f"{pref}_people" in out.columns:
+            out[f"{pref}_people_wow"] = out[f"{pref}_people"].diff()
+        if f"{pref}_percent" in out.columns:
+            out[f"{pref}_percent_wow"] = out[f"{pref}_percent"].diff()
+    return out
+
+def _streak(series: pd.Series, direction: str = "up") -> int:
+    """
+    Count consecutive weeks at the end where diff is >0 (up) or <0 (down).
+    """
+    if series is None or series.empty:
+        return 0
+    s = pd.to_numeric(series, errors="coerce").dropna()
+    if len(s) < 2:
+        return 0
+    d = s.diff().dropna()
+    cnt = 0
+    for v in reversed(d.tolist()):
+        if direction == "up" and v > 0:
+            cnt += 1
+        elif direction == "down" and v < 0:
+            cnt += 1
+        else:
+            break
+    return cnt
+
+def compute_holding_signal(w: pd.DataFrame) -> dict:
+    """
+    Return a compact signal dict for health/decision:
+      - latest percents
+      - WoW deltas
+      - streaks (big up / retail down)
+      - light: GREEN/YELLOW/RED
+    """
+    if w is None or w.empty:
+        return {"ok": False, "light": "N/A", "msg": "無股權分散資料"}
+    last = w.iloc[-1]
+    def _g(name, default=np.nan):
+        return float(last[name]) if name in w.columns and pd.notna(last[name]) else default
+
+    big1000_wow = _g("big_1000_percent_wow", 0.0)
+    big500_wow = _g("big_500_percent_wow", 0.0)
+    retail_wow = _g("retail_1_10_percent_wow", 0.0)
+
+    big1000_streak = _streak(w.get("big_1000_percent", pd.Series(dtype=float)), "up")
+    big500_streak = _streak(w.get("big_500_percent", pd.Series(dtype=float)), "up")
+    retail_down_streak = _streak(w.get("retail_1_10_percent", pd.Series(dtype=float)), "down")
+
+    # Light rules (simple & interpretable)
+    green = ((big500_wow > 0) or (big1000_wow > 0)) and (retail_wow < 0)
+    red = ((big500_wow < 0) and (big1000_wow < 0)) and (retail_wow > 0)
+
+    if green:
+        light = "GREEN"
+        msg = "大戶比例上升、散戶比例下降（結構偏健康）"
+    elif red:
+        light = "RED"
+        msg = "大戶比例下降、散戶比例上升（結構偏弱/分散）"
+    else:
+        light = "YELLOW"
+        msg = "結構中性（需搭配法人/融資與型態）"
+
+    return {
+        "ok": True,
+        "light": light,
+        "msg": msg,
+        "date": str(last.get("date", "")),
+        "retail_pct": _g("retail_1_10_percent"),
+        "retail_wow": retail_wow,
+        "big100_pct": _g("big_100_percent"),
+        "big100_wow": _g("big_100_percent_wow", 0.0),
+        "big500_pct": _g("big_500_percent"),
+        "big500_wow": big500_wow,
+        "big1000_pct": _g("big_1000_percent"),
+        "big1000_wow": big1000_wow,
+        "big500_up_weeks": big500_streak,
+        "big1000_up_weeks": big1000_streak,
+        "retail_down_weeks": retail_down_streak,
+    }
+
+
+# -----------------------------
+# Macro tab helpers
+# -----------------------------
+@st.cache_data(ttl=3600)
+def fetch_forexfactory_calendar_thisweek() -> pd.DataFrame:
+    """
+    Economic calendar (weekly) from ForexFactory public feed (XML).
+    Source: https://nfs.faireconomy.media/ff_calendar_thisweek.xml citeturn0search5
+    """
+    url = "https://nfs.faireconomy.media/ff_calendar_thisweek.xml"
+    try:
+        r = requests.get(url, timeout=20)
+        r.raise_for_status()
+        xml_text = r.text
+    except Exception:
+        return pd.DataFrame()
+
+    try:
+        root = ET.fromstring(xml_text)
+    except Exception:
+        return pd.DataFrame()
+
+    rows = []
+    for ev in root.findall(".//event"):
+        row = {}
+        for child in list(ev):
+            tag = child.tag
+            val = child.text.strip() if child.text else ""
+            row[tag] = val
+        rows.append(row)
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    return df
+
+
+def _ff_to_datetime_taipei(date_str: str, time_str: str) -> str:
+    """
+    Convert FF date+time to Asia/Taipei string.
+    FF feed does not explicitly specify timezone; we assume US/Eastern for conversion.
+    If time is 'All Day' or 'Tentative', return date only.
+    """
+    if not date_str:
+        return ""
+    date_str = date_str.strip()
+    time_str = (time_str or "").strip()
+    if time_str.lower() in ["all day", "tentative", ""]:
+        return date_str
+    # Try parse
+    try:
+        # FF often uses 'YYYY.MM.DD' or 'YYYY-MM-DD' or 'MMM DD, YYYY' depending on feed; handle a few
+        dt = pd.to_datetime(f"{date_str} {time_str}", errors="coerce")
+        if pd.isna(dt):
+            dt = pd.to_datetime(date_str, errors="coerce")
+        if pd.isna(dt):
+            return f"{date_str} {time_str}".strip()
+        # Assume US/Eastern
+        try:
+            from zoneinfo import ZoneInfo
+            et = ZoneInfo("America/New_York")
+            tw = ZoneInfo("Asia/Taipei")
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=et)
+            dt_tw = dt.astimezone(tw)
+            return dt_tw.strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            return dt.strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return f"{date_str} {time_str}".strip()
+
+
+@st.cache_data(ttl=3600)
+def get_us_etf_close_from_stooq(symbol_us: str) -> dict:
+    """
+    Fetch last close and 1D change from Stooq CSV.
+    Example: soxx.us, qqq.us citeturn0search3
+    """
+    url = f"https://stooq.com/q/d/l/?s={symbol_us}&i=d"
+    try:
+        df = pd.read_csv(url)
+    except Exception:
+        return {"ok": False}
+    if df is None or df.empty or "Close" not in df.columns:
+        return {"ok": False}
+    df = df.dropna(subset=["Close"]).copy()
+    if len(df) < 2:
+        last = float(df["Close"].iloc[-1])
+        return {"ok": True, "date": str(df["Date"].iloc[-1]), "close": last, "chg": np.nan, "chg_pct": np.nan}
+    last = float(df["Close"].iloc[-1])
+    prev = float(df["Close"].iloc[-2])
+    chg = last - prev
+    chg_pct = (last / prev - 1.0) * 100.0 if prev != 0 else np.nan
+    return {"ok": True, "date": str(df["Date"].iloc[-1]), "close": last, "chg": chg, "chg_pct": chg_pct}
+
+
+@st.cache_data(ttl=24*3600)
+def get_moneydj_etf_holdings_codes(etf_code: str) -> list[str]:
+    """
+    Fetch Taiwan ETF holdings from MoneyDJ holdings page (HTML table).
+    Works for: 0050 / 006208 / 00878 / 0056 (and more).
+    Example pages:
+      https://www.moneydj.com/etf/x/basic/basic0007.xdjhtm?etfid=0050.tw citeturn7search9
+      https://www.moneydj.com/etf/x/basic/basic0007.xdjhtm?etfid=006208.tw citeturn7search10
+      https://www.moneydj.com/etf/x/basic/basic0007.xdjhtm?etfid=00878.tw citeturn5search9
+      https://www.moneydj.com/etf/x/basic/basic0007.xdjhtm?etfid=0056.tw citeturn5search0
+    """
+    url = f"https://www.moneydj.com/etf/x/basic/basic0007.xdjhtm?etfid={etf_code}.tw"
+    try:
+        tables = pd.read_html(url)
+    except Exception:
+        return []
+    if not tables:
+        return []
+    # find table containing '個股名稱' and '投資比例'
+    target = None
+    for tb in tables:
+        cols = [str(c) for c in tb.columns]
+        if any("個股名稱" in c for c in cols) and any("投資比例" in c for c in cols):
+            target = tb
+            break
+    if target is None:
+        # fallback: first table with at least one column containing (.TW)
+        for tb in tables:
+            s = tb.to_string()
+            if ".TW" in s:
+                target = tb
+                break
+    if target is None:
+        return []
+    # extract 4-digit codes from strings like '台積電(2330.TW)'
+    codes = set()
+    for col in target.columns:
+        series = target[col].astype(str)
+        for v in series.tolist():
+            m = re.findall(r"\((\d{4})\.TW\)", v)
+            for c in m:
+                codes.add(c)
+    # sometimes code may be in separate column
+    for col in target.columns:
+        series = target[col].astype(str)
+        for v in series.tolist():
+            if re.fullmatch(r"\d{4}", v.strip()):
+                codes.add(v.strip())
+    return sorted(list(codes))
+
+
+def compute_tw_etf_breadth(vol_rank_all: pd.DataFrame, etf_code: str) -> dict:
+    """
+    Breadth of ETF constituents using today's market change_rate.
+    """
+    codes = get_moneydj_etf_holdings_codes(etf_code)
+    if not codes:
+        return {"ok": False, "etf": etf_code, "msg": "無法取得成分股清單"}
+    if vol_rank_all is None or vol_rank_all.empty:
+        return {"ok": False, "etf": etf_code, "msg": "無全市場日線/快照資料"}
+
+    df = vol_rank_all.copy()
+    df["stock_id"] = df["stock_id"].astype(str)
+    df = ensure_change_rate(df)
+
+    sub = df[df["stock_id"].isin(codes)].copy()
+    if sub.empty:
+        return {"ok": False, "etf": etf_code, "msg": "成分股與全市場資料無法對齊"}
+
+    up = int((sub["change_rate"] > 0).sum())
+    dn = int((sub["change_rate"] < 0).sum())
+    eq = int((sub["change_rate"] == 0).sum())
+    total = int(len(sub))
+    up_ratio = (up / total * 100.0) if total else np.nan
+    return {"ok": True, "etf": etf_code, "total": total, "up": up, "dn": dn, "eq": eq, "up_ratio": up_ratio}
+
 # -----------------------------
 # Cached downloads
 # -----------------------------
 @st.cache_data(ttl=24 * 3600)
+
+def compute_etf_breadth_regime(vol_rank_all: pd.DataFrame) -> dict:
+    """
+    Build a compact breadth regime from Taiwan ETF constituent breadth.
+    Uses: 0050, 006208 (large-cap) and 00878, 0056 (defensive).
+    Returns:
+      {
+        "rows": DataFrame (ETF, up_ratio, up, dn, eq, total),
+        "large_avg": float,
+        "def_avg": float,
+        "state": "STRONG"/"WEAK"/"DEFENSIVE_ROTATION"/"NEUTRAL",
+        "msg": str
+      }
+    """
+    etfs = ["0050", "006208", "00878", "0056"]
+    rows = []
+    for etf in etfs:
+        b = compute_tw_etf_breadth(vol_rank_all, etf)
+        if b.get("ok"):
+            rows.append({
+                "ETF": etf,
+                "成分股數": b["total"],
+                "上漲": b["up"],
+                "下跌": b["dn"],
+                "平盤": b["eq"],
+                "上漲比例(%)": float(b["up_ratio"]) if pd.notna(b["up_ratio"]) else np.nan,
+            })
+        else:
+            rows.append({"ETF": etf, "成分股數": np.nan, "上漲": np.nan, "下跌": np.nan, "平盤": np.nan, "上漲比例(%)": np.nan})
+
+    dfb = pd.DataFrame(rows)
+    def _avg(codes):
+        s = dfb[dfb["ETF"].isin(codes)]["上漲比例(%)"]
+        s = pd.to_numeric(s, errors="coerce")
+        return float(s.mean()) if s.notna().any() else np.nan
+
+    large_avg = _avg(["0050", "006208"])
+    def_avg = _avg(["00878", "0056"])
+
+    state = "NEUTRAL"
+    msg = "市場寬度中性：以個股與族群主流判斷為主。"
+
+    if pd.notna(large_avg) and large_avg <= 45:
+        state = "WEAK"
+        msg = "市場寬度偏弱：盤面可能『權值撐盤或退潮』，策略宜保守、避免追突破。"
+    elif pd.notna(large_avg) and pd.notna(def_avg) and (large_avg >= 60 and def_avg >= 60):
+        state = "STRONG"
+        msg = "市場寬度強：多數成分股齊漲，趨勢延續機率較高，可較積極。"
+    elif pd.notna(large_avg) and pd.notna(def_avg) and (def_avg - large_avg >= 15):
+        state = "DEFENSIVE_ROTATION"
+        msg = "防禦寬度較強：高股息/防禦股較活躍，風險偏好下降，突破追價需更謹慎。"
+
+    return {"rows": dfb, "large_avg": large_avg, "def_avg": def_avg, "state": state, "msg": msg}
+
+
+
+# -----------------------------
+# Breadth dataset (CSV) helpers for Streamlit Cloud (reduce load for multi-user)
+# -----------------------------
+BREADTH_CSV_PATH = Path("data") / "breadth_2y.csv"
+
+def load_breadth_csv() -> pd.DataFrame:
+    if not BREADTH_CSV_PATH.exists():
+        return pd.DataFrame()
+    try:
+        df = pd.read_csv(BREADTH_CSV_PATH)
+        # expected columns: date, adv, dec, eq, ratio, proxy_close, ret_1d, fwd_1d, fwd_5d, fwd_20d, idx_up_breadth_bad, idx_dn_breadth_good
+        if "date" in df.columns:
+            df["date"] = df["date"].astype(str)
+        for c in ["ratio", "proxy_close", "ret_1d", "fwd_1d", "fwd_5d", "fwd_20d"]:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+        for c in ["idx_up_breadth_bad", "idx_dn_breadth_good"]:
+            if c in df.columns:
+                df[c] = df[c].astype(bool)
+        return df.dropna(subset=["ratio", "proxy_close"]).sort_values("date").reset_index(drop=True)
+    except Exception:
+        return pd.DataFrame()
+
+def save_breadth_csv(df: pd.DataFrame) -> None:
+    BREADTH_CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(BREADTH_CSV_PATH, index=False)
+
+def breadth_csv_meta() -> str:
+    if not BREADTH_CSV_PATH.exists():
+        return "尚未生成 breadth_2y.csv"
+    try:
+        ts = BREADTH_CSV_PATH.stat().st_mtime
+        return f"breadth_2y.csv 已存在（更新時間：{datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S')}）"
+    except Exception:
+        return "breadth_2y.csv 已存在"
+
+# -----------------------------
+# Breadth backtest (2 years): Full-market breadth vs index proxy (0050)
+# -----------------------------
+@st.cache_data(ttl=24 * 3600)
+def get_trading_dates_range_cached(token: str, start_date: str, end_date: str) -> list[str]:
+    df = finmind_get_data(token, dataset="TaiwanStockTradingDate", timeout=40)
+    if df is None or df.empty or "date" not in df.columns:
+        return []
+    d = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
+    out = [x for x in d.tolist() if (x >= start_date and x <= end_date)]
+    return out
+
+@st.cache_data(ttl=24 * 3600)
+def get_breadth_for_date_cached(token: str, date_str: str) -> dict:
+    df = finmind_get_data(token, dataset="TaiwanStockPrice", start_date=date_str, timeout=60)
+    if df is None or df.empty:
+        return {"date": date_str, "adv": np.nan, "dec": np.nan, "eq": np.nan, "ratio": np.nan}
+    df = df.copy()
+    df = ensure_change_rate(df)
+    adv = int((df["change_rate"] > 0).sum())
+    dec = int((df["change_rate"] < 0).sum())
+    eq = int((df["change_rate"] == 0).sum())
+    denom = adv + dec
+    ratio = (adv / denom) if denom > 0 else np.nan
+    return {"date": date_str, "adv": adv, "dec": dec, "eq": eq, "ratio": ratio}
+
+@st.cache_data(ttl=24 * 3600)
+def build_breadth_series_2y(token: str, proxy_id: str = "0050", years: int = 2) -> pd.DataFrame:
+    # Date range
+    end_date = _now_date_str()
+    start_date = (datetime.now(tz=TZ) - timedelta(days=365 * years + 30) if TZ else datetime.now() - timedelta(days=365 * years + 30)).strftime("%Y-%m-%d")
+
+    dates = get_trading_dates_range_cached(token, start_date, end_date)
+    if not dates:
+        return pd.DataFrame()
+
+    # Keep last ~2 years trading days
+    # (trading dates list may include extra buffer)
+    dates = dates[-(years * 260 + 30):]
+
+    # Breadth per day
+    rows = []
+    for d in dates:
+        rows.append(get_breadth_for_date_cached(token, d))
+    b = pd.DataFrame(rows).dropna(subset=["ratio"])
+    if b.empty:
+        return pd.DataFrame()
+
+    # Index proxy series
+    px = finmind_get_data(token, dataset="TaiwanStockPrice", data_id=proxy_id, start_date=dates[0], timeout=40)
+    if px is None or px.empty or "date" not in px.columns or "close" not in px.columns:
+        return pd.DataFrame()
+    px = normalize_date_col(px, "date")
+    px["close"] = pd.to_numeric(px["close"], errors="coerce")
+    px = px.dropna(subset=["close"])
+
+    df = b.merge(px[["date", "close"]].rename(columns={"close": "proxy_close"}), on="date", how="inner").sort_values("date")
+    if df.empty:
+        return pd.DataFrame()
+
+    # Returns
+    df["ret_1d"] = df["proxy_close"].pct_change(1) * 100.0
+    df["fwd_1d"] = df["proxy_close"].pct_change(-1) * -100.0
+    df["fwd_5d"] = df["proxy_close"].pct_change(-5) * -100.0
+    df["fwd_20d"] = df["proxy_close"].pct_change(-20) * -100.0
+
+    # Divergence flags
+    df["idx_up_breadth_bad"] = (df["ret_1d"] > 0) & (df["ratio"] < 0.50)
+    df["idx_dn_breadth_good"] = (df["ret_1d"] < 0) & (df["ratio"] > 0.55)
+
+    return df.reset_index(drop=True)
+
+def backtest_breadth_vs_index(df: pd.DataFrame, horizon: int = 5) -> dict:
+    if df is None or df.empty:
+        return {"ok": False, "msg": "無資料"}
+
+    fwd_col = {1: "fwd_1d", 5: "fwd_5d", 20: "fwd_20d"}.get(int(horizon), "fwd_5d")
+    d = df.copy()
+    d = d.dropna(subset=["ratio", fwd_col])
+
+    if d.empty:
+        return {"ok": False, "msg": "資料不足（無法計算）"}
+
+    # Correlation
+    corr = float(d["ratio"].corr(d[fwd_col])) if d["ratio"].notna().any() else np.nan
+
+    # Quintiles
+    d["q"] = pd.qcut(d["ratio"], 5, labels=False, duplicates="drop")
+    qtbl = d.groupby("q")[fwd_col].agg(["mean", "count"]).reset_index()
+    qtbl["win_rate"] = d.groupby("q")[fwd_col].apply(lambda s: float((s > 0).mean()) if len(s) else np.nan).values
+
+    # Divergence stats
+    def _evt(mask):
+        x = d[mask]
+        if x.empty:
+            return {"n": 0, "avg": np.nan, "win": np.nan}
+        return {"n": int(len(x)), "avg": float(x[fwd_col].mean()), "win": float((x[fwd_col] > 0).mean())}
+
+    evt1 = _evt(d["idx_up_breadth_bad"])
+    evt2 = _evt(d["idx_dn_breadth_good"])
+
+    return {"ok": True, "fwd_col": fwd_col, "corr": corr, "qtbl": qtbl, "evt_up_bad": evt1, "evt_dn_good": evt2}
+
 def get_stock_info_cached(token: str) -> pd.DataFrame:
     return finmind_get_data(token, dataset="TaiwanStockInfo", timeout=30)
 
@@ -2029,6 +2579,8 @@ def oldwang_screener(
     market_filter: str = "ALL",  # ALL / TSE / OTC
     strict_market: bool = True,
     new_complete_filter: str = "不限",  # 不限 / 今日新三陽 / 今日新三陽(強) / 今日新四海
+    new_complete_days: int = 1,
+    universe_all: bool = False,
 ) -> pd.DataFrame:
     """
     依據老王策略做選股（全市場掃描）：
@@ -2083,7 +2635,10 @@ def oldwang_screener(
         return pd.DataFrame()
 
     # Universe by money
-    df0 = df0.sort_values(money_col, ascending=False).head(int(universe_top_n)).copy()
+    if universe_all:
+        df0 = df0.copy()
+    else:
+        df0 = df0.sort_values(money_col, ascending=False).head(int(universe_top_n)).copy()
 
         # --- 市場篩選（上市/上櫃）---
     # 依 TaiwanStockInfo 的市場欄位做篩選；若無該欄位則略過。
@@ -2282,42 +2837,51 @@ def oldwang_screener(
         except Exception:
             hold10_two = False
         three_strong = bool(three and pd.notna(ma5) and pd.notna(ma10) and pd.notna(ma20) and (ma5 > ma10 > ma20) and (pd.isna(ma20_slope) or ma20_slope >= 0 or hold10_two))
-
-        # 今日新成立：昨天未成立、今天才成立（抓起漲股）
+        # 今日新成立（多日視窗）：最近 N 日內出現「由 False -> True」的成立事件（抓起漲股）
         new_three = False
         new_three_strong = False
         new_four = False
+        confirm_three_2d = False
+        confirm_three_strong_2d = False
+        confirm_four_2d = False
+        ma20_up = False
+        kdr20_good = False
+        kdr20 = np.nan
+        ma20_up = False
+        kdr20_good = False
+        kdr20 = np.nan
         try:
-            if len(g) >= 61:
-                prev_close = float(g["close"].iloc[-2])
-                prev_ma5 = float(g["MA5"].iloc[-2]) if pd.notna(g["MA5"].iloc[-2]) else np.nan
-                prev_ma10 = float(g["MA10"].iloc[-2]) if pd.notna(g["MA10"].iloc[-2]) else np.nan
-                prev_ma20 = float(g["MA20"].iloc[-2]) if pd.notna(g["MA20"].iloc[-2]) else np.nan
-                prev_ma60 = float(g["MA60"].iloc[-2]) if pd.notna(g["MA60"].iloc[-2]) else np.nan
+            # 計算 MA20 斜率（近5日）與扣抵（20交易日前收盤）
+            if len(g) >= 25:
+                ma20_series = g["close"].rolling(20).mean()
+                ma20_slope = float(ma20_series.iloc[-1] - ma20_series.iloc[-6]) if pd.notna(ma20_series.iloc[-1]) and pd.notna(ma20_series.iloc[-6]) else np.nan
+                ma20_up = bool(pd.notna(ma20_slope) and ma20_slope >= 0)
+            if len(g) >= 21:
+                kdr20 = float(g["close"].iloc[-21]) if pd.notna(g["close"].iloc[-21]) else np.nan
+                kdr20_good = bool(pd.notna(kdr20) and close >= kdr20)
 
-                three_prev = pd.notna(prev_ma5) and pd.notna(prev_ma10) and pd.notna(prev_ma20) and prev_close >= prev_ma5 and prev_close >= prev_ma10 and prev_close >= prev_ma20
-                four_prev = bool(three_prev and pd.notna(prev_ma60) and prev_close >= prev_ma60)
+            n = int(max(1, min(10, new_complete_days)))
 
-                # 三陽強（昨日）判斷（用昨日均線排列 + MA20翻揚或10MA連兩日守住）
-                prev_three_strong = False
-                try:
-                    prev_ma20_slope = np.nan
-                    if len(g) >= 66:
-                        prev_ma20_slope = float(g["MA20"].iloc[-2] - g["MA20"].iloc[-7])
-                    prev_hold10_two = False
-                    if len(g) >= 3 and pd.notna(prev_ma10):
-                        prev_hold10_two = bool(g["close"].iloc[-2] >= g["MA10"].iloc[-2] and g["close"].iloc[-3] >= g["MA10"].iloc[-3])
-                    prev_three_strong = bool(
-                        three_prev and pd.notna(prev_ma5) and pd.notna(prev_ma10) and pd.notna(prev_ma20)
-                        and (prev_ma5 > prev_ma10 > prev_ma20)
-                        and (pd.isna(prev_ma20_slope) or prev_ma20_slope >= 0 or prev_hold10_two)
-                    )
-                except Exception:
-                    prev_three_strong = False
+            ma5_s = g["close"].rolling(5).mean()
+            ma10_s = g["close"].rolling(10).mean()
+            ma20_s = g["close"].rolling(20).mean()
+            ma60_s = g["close"].rolling(60).mean()
 
-                new_three = bool(three and (not three_prev))
-                new_four = bool(four and (not four_prev))
-                new_three_strong = bool(three_strong and (not prev_three_strong))
+            three_s = (g["close"] >= ma5_s) & (g["close"] >= ma10_s) & (g["close"] >= ma20_s)
+            four_s = three_s & (g["close"] >= ma60_s)
+
+            ma20_slope_s = ma20_s - ma20_s.shift(5)
+            hold10_two_s = (g["close"] >= ma10_s) & (g["close"].shift(1) >= ma10_s.shift(1))
+            three_strong_s = three_s & (ma5_s > ma10_s) & (ma10_s > ma20_s) & ((ma20_slope_s >= 0) | hold10_two_s)
+
+            new_three = bool((three_s & (~three_s.shift(1).fillna(False))).tail(n).any())
+            new_four = bool((four_s & (~four_s.shift(1).fillna(False))).tail(n).any())
+            new_three_strong = bool((three_strong_s & (~three_strong_s.shift(1).fillna(False))).tail(n).any())
+
+            # 連續2日確認（避免盤整反覆穿越造成假訊號）
+            confirm_three_2d = bool(three_s.iloc[-1] and three_s.iloc[-2]) if len(three_s) >= 2 else False
+            confirm_four_2d = bool(four_s.iloc[-1] and four_s.iloc[-2]) if len(four_s) >= 2 else False
+            confirm_three_strong_2d = bool(three_strong_s.iloc[-1] and three_strong_s.iloc[-2]) if len(three_strong_s) >= 2 else False
         except Exception:
             pass
 
@@ -2391,7 +2955,7 @@ def oldwang_screener(
                 pass_filter_pattern = bool(three_strong and (bias_state != "DANGER"))
                 startup_tag = "起漲-拉回承接"
             elif startup_mode == "起漲-突破發動":
-                pass_filter_pattern = bool(breakout_ok and three and (bias_state != "DANGER"))
+                pass_filter_pattern = bool(breakout_ok and (bias_state != "DANGER"))
                 startup_tag = "起漲-突破發動"
             elif startup_mode == "趨勢-四海遊龍續漲":
                 pass_filter_pattern = bool(four and (bias_state != "DANGER"))
@@ -2400,7 +2964,10 @@ def oldwang_screener(
                 startup_tag = "自訂"
 
 
-        # 今日新成立過濾（抓「今天剛成立」的三陽/四海）
+        # 今日新成立過濾（兩段式）：第一段只抓事件
+        two_stage_new = bool(new_complete_filter != "不限")
+
+        # 今日新成立過濾（抓新成立事件）
         pass_filter_new = True
         if new_complete_filter == "今日新三陽":
             pass_filter_new = bool(new_three)
@@ -2409,6 +2976,10 @@ def oldwang_screener(
         elif new_complete_filter == "今日新四海":
             pass_filter_new = bool(new_four)
 
+        if two_stage_new:
+            pass_filter_leader = True
+            pass_filter_breakout = True
+            pass_filter_pattern = True
         if require_pattern == "三陽開泰":
             pass_filter_pattern = bool(three)
         elif require_pattern == "四海遊龍":
@@ -2421,6 +2992,16 @@ def oldwang_screener(
 
         if not (pass_filter_leader and pass_filter_pattern and pass_filter_breakout and pass_filter_new):
             continue
+
+        # 新成立確認狀態（僅做標記，不硬過濾）
+        confirm_status = ""
+        if new_complete_filter != "不限":
+            if new_complete_filter == "今日新三陽":
+                confirm_status = "已確認" if confirm_three_2d else "待確認"
+            elif new_complete_filter == "今日新三陽(強)":
+                confirm_status = "已確認" if confirm_three_strong_2d else "待確認"
+            elif new_complete_filter == "今日新四海":
+                confirm_status = "已確認" if confirm_four_2d else "待確認"
 
         # 量價型態（快速標籤）
         try:
@@ -2503,15 +3084,28 @@ def oldwang_screener(
             elif rs_rank >= 0.6:
                 s += 1
 
-                three_strong = three_strong if 'three_strong' in locals() else False
-        startup_tag = startup_tag if 'startup_tag' in locals() else "自訂"
-# --- startup_mode bonus（加分項）---
+        # --- startup_mode bonus（加分項）---
         if startup_tag == "起漲-拉回承接" and three_strong:
             s += 4
-        elif startup_tag == "起漲-突破發動" and breakout_ok and three:
+        elif startup_tag == "起漲-突破發動" and breakout_ok:
             s += 5
         elif startup_tag == "趨勢-四海遊龍續漲" and four and hold10:
             s += 4
+
+        # 市場寬度加權（盤後）：寬度偏弱時偏保守；寬度強時略加分
+        try:
+            breg = st.session_state.get('breadth_regime', {})
+            bstate = str(breg.get('state','NEUTRAL'))
+            if bstate == 'WEAK':
+                s -= 3
+                reasons.append('市場寬度偏弱')
+            elif bstate == 'STRONG':
+                s += 1
+            elif bstate == 'DEFENSIVE_ROTATION':
+                s -= 1
+                reasons.append('防禦寬度較強')
+        except Exception:
+            pass
 
         # Clamp score
         s = max(0, min(100, s))
@@ -2523,12 +3117,18 @@ def oldwang_screener(
             "漲跌幅(%)": round(chg, 2),
             "成交金額(億)": round(money / 1e8, 2),
             "量比": round(vol_ratio, 2),
+            "確認狀態": confirm_status,
+            "連2日三陽": bool(confirm_three_2d),
+            "連2日三陽(強)": bool(confirm_three_strong_2d),
+            "連2日四海": bool(confirm_four_2d),
+            "MA20翻揚": bool(ma20_up),
+            "扣抵值(20)": round(kdr20, 2) if pd.notna(kdr20) else np.nan,
+            "扣抵有利": bool(kdr20_good),
             "RS{}超越大盤(%)".format(rs_window): round(rs_out, 2) if pd.notna(rs_out) else np.nan,
             "RS Rank(%)": round(rs_rank * 100, 1) if pd.notna(rs_rank) else np.nan,
             "BIAS20(%)": round(bias20, 2) if pd.notna(bias20) else np.nan,
             "股性": profile,
             "起漲型態": startup_tag,
-            "突破發動需三陽": True,
             "三陽開泰(強)": bool(three_strong),
             "主題標記": " / ".join(sorted(list(theme_tag_map.get(sid, set())))) if isinstance(theme_tag_map, dict) else "",
             "三陽開泰": bool(three),
@@ -2549,7 +3149,6 @@ def oldwang_screener(
     out = pd.DataFrame(rows).sort_values(["老王分數", "成交金額(億)"], ascending=[False, False]).head(int(output_top_k)).reset_index(drop=True)
     out.insert(0, "Rank", range(1, len(out) + 1))
     return out
-
 # -----------------------------
 # Orchestrator
 # -----------------------------
@@ -2654,6 +3253,16 @@ def run_all_features(
     res["market_meta"] = meta
     res["sector_flow"] = sector_flow
     res["volume_rank"] = vol_rank
+
+    # ETF market breadth regime (0050/006208 vs 00878/0056)
+    try:
+        etf_b = compute_etf_breadth_regime(vol_rank)
+    except Exception:
+        etf_b = {"rows": pd.DataFrame(), "large_avg": np.nan, "def_avg": np.nan, "state": "NEUTRAL", "msg": "市場寬度資料不足"}
+    res["etf_breadth"] = etf_b
+    # also expose to session_state for screener / UI
+    st.session_state["breadth_regime"] = etf_b
+
 
     # sector strength & leaders
     res["sector_strength"] = compute_sector_strength(vol_rank, sector_flow, top_n=60)
@@ -2793,10 +3402,9 @@ if st.sidebar.button("清除結果"):
     st.session_state["result"] = None
     st.sidebar.info("已清除")
 
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
-    ["1. 健診/技術圖", "2. 資金流向儀錶板", "3. 營收診斷", "4. 主題族群雷達", "5. 交易計畫引擎", "6. 老王選股器"]
-)
-
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 , tab8 = st.tabs([
+        "1. 健診/技術圖", "2. 資金流向儀錶板", "3. 營收診斷", "4. 主題族群雷達", "5. 交易計畫引擎", "6. 老王選股器", "7. 宏觀追蹤", "8. 回測研究"
+    ])
 res = st.session_state.get("result")
 
 # -----------------------------
@@ -2804,6 +3412,7 @@ res = st.session_state.get("result")
 # -----------------------------
 with tab1:
     st.subheader("健診：老王策略 + 籌碼分析（5/10/20/60 + 三陽開泰/四海遊龍 + 法人/融資）")
+    st.caption("提示：健診結論會參考 ETF 市場寬度（0050/006208 vs 00878/0056）。")
     if res is None or res.get("stock_id") != target_sid:
         st.info("請先按左側「一鍵更新（含交易計畫引擎）」取得資料。")
     else:
@@ -2956,6 +3565,46 @@ with tab1:
                 st.caption("籌碼圖表資料不足（請稍後重試或確認資料區間）。")
 
             # --- 技術圖（加上 5/10/20/60） ---
+            
+            # --- 大戶 vs 散戶（每週股權分散）---
+            st.markdown("### 籌碼結構：大戶 vs 散戶（每週）")
+            w_holding = build_retail_big_weekly(token, target_sid, start_date="2019-01-01")
+            sig_h = compute_holding_signal(w_holding)
+
+            if sig_h.get("ok"):
+                k1, k2, k3, k4 = st.columns(4)
+                k1.metric("籌碼結構燈號", sig_h["light"])
+                k2.metric("大戶>=500張 WoW(%)", f"{sig_h['big500_wow']:+.2f}")
+                k3.metric("大戶>=1000張 WoW(%)", f"{sig_h['big1000_wow']:+.2f}")
+                k4.metric("散戶1-10張 WoW(%)", f"{sig_h['retail_wow']:+.2f}")
+                st.caption(f"{sig_h['date']}｜{sig_h['msg']}｜連續週數：大戶>=500 ↑{sig_h['big500_up_weeks']}、大戶>=1000 ↑{sig_h['big1000_up_weeks']}、散戶(1-10) ↓{sig_h['retail_down_weeks']}")
+            else:
+                st.info("無法取得股權分散資料（可能該股資料不足或資料源暫時不可用）。")
+
+            with st.expander("查看：大戶/散戶每週明細與圖表", expanded=False):
+                if w_holding is None or w_holding.empty:
+                    st.info("本股無股權分散資料。")
+                else:
+                    show_cols = ["date",
+                                 "retail_1_10_percent","retail_1_10_percent_wow",
+                                 "big_100_percent","big_100_percent_wow",
+                                 "big_500_percent","big_500_percent_wow",
+                                 "big_1000_percent","big_1000_percent_wow"]
+                    show_cols = [c for c in show_cols if c in w_holding.columns]
+                    st.dataframe(w_holding[show_cols].tail(26), use_container_width=True)
+
+                    figh = go.Figure()
+                    if "retail_1_10_percent" in w_holding.columns:
+                        figh.add_trace(go.Scatter(x=w_holding["date"], y=w_holding["retail_1_10_percent"], name="散戶(1-10張)%"))
+                    if "big_100_percent" in w_holding.columns:
+                        figh.add_trace(go.Scatter(x=w_holding["date"], y=w_holding["big_100_percent"], name="大戶(>=100張)%"))
+                    if "big_500_percent" in w_holding.columns:
+                        figh.add_trace(go.Scatter(x=w_holding["date"], y=w_holding["big_500_percent"], name="大戶(>=500張)%"))
+                    if "big_1000_percent" in w_holding.columns:
+                        figh.add_trace(go.Scatter(x=w_holding["date"], y=w_holding["big_1000_percent"], name="大戶(>=1000張)%"))
+                    figh.update_layout(height=420, margin=dict(l=10, r=10, t=10, b=10))
+                    st.plotly_chart(figh, use_container_width=True)
+
             st.markdown("### 技術圖（含 5/10/20/60）")
             fig = go.Figure()
             fig.add_trace(go.Scatter(x=t["date"], y=t["close"], name="Close", mode="lines"))
@@ -3338,6 +3987,7 @@ with tab5:
 with tab6:
     st.subheader("老王選股器（5/10/20/60 + 三陽開泰/四海遊龍 + 帶量突破 + 守10MA + 領導股）")
 
+
     if res is None:
         st.info("請先按左側「一鍵更新（含交易計畫引擎）」，取得全市場掃描資料後再跑選股器。")
     else:
@@ -3347,28 +3997,46 @@ with tab6:
 
         st.caption(f"資料來源：{meta.get('source','')}；掃描日期：{meta.get('scan_date','')}")
 
+        st.markdown("### 盤後一鍵模式")
+        if st.button("📌 套用盤後雷達模式（推薦）", key="ow_preset_postclose"):
+            # 盤後建議：全市場掃描 + 今日新三陽(強) + 視窗=1天，其他條件改用表格排序挑選
+            st.session_state["ow_universe_mode"] = "全市場（較慢）"
+            st.session_state["ow_new_complete"] = "今日新三陽(強)"
+            st.session_state["ow_new_days"] = 1
+            st.session_state["ow_startup_mode"] = "自訂"
+            st.session_state["ow_market_filter"] = "全部"
+            st.session_state["ow_strict_market"] = True
+            st.session_state["ow_debug_market"] = False
+            st.session_state["ow_min_money_yi"] = 0.0
+            st.session_state["ow_require_leader"] = False
+            st.session_state["ow_require_breakout"] = False
+            st.session_state["ow_require_pattern"] = "不限"
+            st.session_state["ow_universe_top_n"] = 500
+            st.session_state["ow_output_top_k"] = 80
+            st.session_state["ow_rs_bonus_weight"] = 6
+
         c1, c2, c3, c4 = st.columns(4)
-        universe_top_n = c1.number_input("候選池（依成交金額前 N）", min_value=50, max_value=800, value=300, step=50)
-        output_top_k = c2.number_input("輸出 Top K", min_value=20, max_value=200, value=80, step=10)
-        rs_bonus_weight = st.slider("RS 加分權重（加分項）", min_value=0, max_value=10, value=6, step=1)
-        market_filter_ui = st.selectbox("市場篩選", options=["全部", "上市(TSE)", "上櫃(OTC)"], index=0)
-        strict_market_ui = st.checkbox("嚴格市場篩選（不回退）", value=True)
-        debug_market_ui = st.checkbox("顯示市場篩選診斷", value=False)
-        startup_mode_ui = st.selectbox("起漲模式", options=["自訂", "起漲-拉回承接", "起漲-突破發動", "趨勢-四海遊龍續漲"], index=0)
-        new_complete_ui = st.selectbox("今日新成立過濾", options=["不限", "今日新三陽", "今日新三陽(強)", "今日新四海"], index=0)
+        universe_top_n = c1.number_input("候選池（依成交金額前 N）", min_value=50, max_value=800, value=300, step=50, key="ow_universe_top_n")
+        universe_mode_ui = st.selectbox("候選池模式", options=["成交金額TopN（較快）", "全市場（較慢）"], index=0, key="ow_universe_mode")
+        output_top_k = c2.number_input("輸出 Top K", min_value=20, max_value=200, value=80, step=10, key="ow_output_top_k")
+        rs_bonus_weight = st.slider("RS 加分權重（加分項）", min_value=0, max_value=10, value=6, step=1, key="ow_rs_bonus_weight")
+        market_filter_ui = st.selectbox("市場篩選", options=["全部", "上市(TSE)", "上櫃(OTC)"], index=0, key="ow_market_filter")
+        strict_market_ui = st.checkbox("嚴格市場篩選（不回退）", value=True, key="ow_strict_market")
+        debug_market_ui = st.checkbox("顯示市場篩選診斷", value=False, key="ow_debug_market")
+        startup_mode_ui = st.selectbox("起漲模式", options=["自訂", "起漲-拉回承接", "起漲-突破發動", "趨勢-四海遊龍續漲"], index=0, key="ow_startup_mode")
+        new_complete_ui = st.selectbox("今日新成立過濾", options=["不限", "今日新三陽", "今日新三陽(強)", "今日新四海"], index=0, key="ow_new_complete")
+        # 今日新成立視窗（交易日）：1=今天剛成立；3/5=近幾天剛成立
+        new_complete_days_ui = 1
+        if str(new_complete_ui) != "不限":
+            new_complete_days_ui = st.slider("新成立視窗（交易日）", min_value=1, max_value=10, value=1, step=1, key="ow_new_days")
+            st.info("兩段式：只抓『新成立事件』；其他嚴格條件將自動忽略。請用下方表格欄位（RS/成交金額/是否領導股等）排序人工挑。")
         st.caption("市場篩選：若資料源無法辨識上市/上櫃欄位，系統會自動回退為不篩選（避免結果為空）。")
-        min_money_yi = c3.number_input("成交金額門檻（億）", min_value=0.0, max_value=50.0, value=1.0, step=0.5)
-        require_leader = c4.checkbox("只挑族群領導股（Top3）", value=True)
+        min_money_yi = c3.number_input("成交金額門檻（億）", min_value=0.0, max_value=50.0, value=1.0, step=0.5, key="ow_min_money_yi")
+        require_leader = c4.checkbox("只挑族群領導股（Top3）", value=True, key="ow_require_leader")
 
         c5, c6 = st.columns(2)
-        # 當你啟用「今日新成立過濾」時，型態過濾會自動隱藏，避免條件重複/打架
-        if str(new_complete_ui) != "不限":
-            require_pattern = "不限"
-            c5.caption("已啟用「今日新成立過濾」，型態過濾已隱藏")
-        else:
-            require_pattern = c5.selectbox("型態過濾", ["不限", "三陽開泰", "四海遊龍"], index=0)
-
-        require_breakout = c6.checkbox("只挑『突破前高且帶量』", value=False)
+        require_pattern = c5.selectbox("型態過濾", ["不限", "三陽開泰", "四海遊龍"], index=0, key="ow_require_pattern")
+        require_breakout = c6.checkbox("只挑『突破前高且帶量』", value=False, key="ow_require_breakout")
 
         run_btn = st.button("🚀 執行老王選股器", type="primary")
 
@@ -3404,6 +4072,8 @@ with tab6:
                         strict_market=bool(strict_market_ui) if 'strict_market_ui' in locals() else True,
                         startup_mode=str(startup_mode_ui) if 'startup_mode_ui' in locals() else '自訂',
                         new_complete_filter=str(new_complete_ui) if 'new_complete_ui' in locals() else '不限',
+                        new_complete_days=int(new_complete_days_ui) if 'new_complete_days_ui' in locals() else 1,
+                        universe_all=bool(universe_mode_ui.startswith('全市場')) if 'universe_mode_ui' in locals() else False,
                     )
 
                     if 'debug_market_ui' in locals() and debug_market_ui:
@@ -3435,3 +4105,175 @@ with tab6:
 
             csv = df_pick.to_csv(index=False).encode("utf-8-sig")
             st.download_button("下載 CSV", data=csv, file_name="oldwang_screener.csv", mime="text/csv")
+
+# -----------------------------
+# Tab 7: 宏觀追蹤
+# -----------------------------
+with tab7:
+    st.subheader("宏觀追蹤（美國經濟數據日曆 + 美股ETF收盤 + 台灣ETF市場寬度）")
+
+    # 1) US economic calendar
+    st.markdown("### 1) 美國經濟數據日曆（本週）")
+    cal = fetch_forexfactory_calendar_thisweek()
+    if cal is None or cal.empty:
+        st.info("無法取得經濟日曆資料（來源可能暫時不可用）。")
+    else:
+        # normalize columns if present
+        show = cal.copy()
+        # filter USD only (common column 'country')
+        if "country" in show.columns:
+            show = show[show["country"].astype(str).str.upper() == "USD"].copy()
+        # impact filter
+        impact_levels = []
+        if "impact" in show.columns:
+            impact_levels = sorted(show["impact"].dropna().unique().tolist())
+        impact_sel = st.multiselect("重要性（impact）", options=impact_levels if impact_levels else ["High","Medium","Low"], default=[x for x in ["High","Medium"] if x in (impact_levels or ["High","Medium"])])
+        if "impact" in show.columns and impact_sel:
+            show = show[show["impact"].isin(impact_sel)].copy()
+
+        # build Taipei time column
+        if "date" in show.columns:
+            if "time" in show.columns:
+                show["台北時間"] = show.apply(lambda r: _ff_to_datetime_taipei(str(r.get("date","")), str(r.get("time",""))), axis=1)
+            else:
+                show["台北時間"] = show["date"].astype(str)
+
+        cols = []
+        for c in ["台北時間", "title", "impact", "previous", "forecast", "actual"]:
+            if c in show.columns:
+                cols.append(c)
+        # fallback columns
+        if not cols:
+            cols = list(show.columns)[:8]
+        show = show.sort_values(cols[0]) if cols else show
+        st.dataframe(show[cols].head(80), use_container_width=True)
+
+    st.markdown("---")
+
+    # 2) US ETFs after close
+    st.markdown("### 2) 美股收盤追蹤：SOXX 與 QQQ（收盤價與漲跌幅）")
+    c1, c2 = st.columns(2)
+    with c1:
+        soxx = get_us_etf_close_from_stooq("soxx.us")
+        if soxx.get("ok"):
+            st.metric("SOXX 收盤", f"{soxx['close']:.2f}", f"{soxx['chg']:+.2f} ({soxx['chg_pct']:+.2f}%)")
+            st.caption(f"日期：{soxx.get('date','')}")
+        else:
+            st.info("SOXX 資料取得失敗")
+    with c2:
+        qqq = get_us_etf_close_from_stooq("qqq.us")
+        if qqq.get("ok"):
+            st.metric("QQQ 收盤", f"{qqq['close']:.2f}", f"{qqq['chg']:+.2f} ({qqq['chg_pct']:+.2f}%)")
+            st.caption(f"日期：{qqq.get('date','')}")
+        else:
+            st.info("QQQ 資料取得失敗")
+
+    st.markdown("---")
+
+    # 3) Taiwan ETF breadth
+    st.markdown("### 3) 台灣ETF市場寬度（成分股：上漲/下跌/平盤）")
+    if res is None:
+        st.info("請先在主流程更新全市場資料（左側一鍵更新）後再查看寬度。")
+    else:
+        vol_rank_all = res.get("volume_rank", pd.DataFrame())
+        etfs = ["0050", "006208", "00878", "0056"]
+        rows = []
+        for etf in etfs:
+            b = compute_tw_etf_breadth(vol_rank_all, etf)
+            if b.get("ok"):
+                rows.append({
+                    "ETF": etf,
+                    "成分股數": b["total"],
+                    "上漲": b["up"],
+                    "下跌": b["dn"],
+                    "平盤": b["eq"],
+                    "上漲比例(%)": round(b["up_ratio"], 1) if pd.notna(b["up_ratio"]) else np.nan,
+                })
+            else:
+                rows.append({"ETF": etf, "成分股數": np.nan, "上漲": np.nan, "下跌": np.nan, "平盤": np.nan, "上漲比例(%)": np.nan})
+        dfb = pd.DataFrame(rows)
+        st.dataframe(dfb, use_container_width=True)
+
+        # breadth regime summary
+        try:
+            etf_b = compute_etf_breadth_regime(vol_rank_all)
+            st.markdown(f"**寬度狀態：{etf_b.get('state','NEUTRAL')}**｜{etf_b.get('msg','')}")
+        except Exception:
+            pass
+
+        st.caption("說明：成分股清單來源為 MoneyDJ ETF 持股表，並用全市場日線/快照的 change_rate 計算當日上漲/下跌家數。")
+
+
+
+# -----------------------------
+# Tab 8: 回測研究（2年）
+# -----------------------------
+
+# -----------------------------
+# Tab 8: 回測研究（2年）
+# -----------------------------
+with tab8:
+    st.subheader("回測研究：市場寬度 vs 台股（近2年）")
+
+    st.caption("建議做法（多人使用更穩）：回測預設讀取 data/breadth_2y.csv（預先計算好的寬度序列）。只有管理者才需要更新該檔案。")
+
+    st.info(breadth_csv_meta())
+
+    horizon = st.selectbox("預測視窗（交易日）", options=[1, 5, 20], index=1)
+
+    df_csv = load_breadth_csv()
+    if df_csv.empty:
+        st.warning("尚未偵測到 data/breadth_2y.csv。請由管理者在下方生成（或把檔案放進 repo 的 data/ 目錄）。")
+    else:
+        rb = backtest_breadth_vs_index(df_csv, horizon=int(horizon))
+        if isinstance(rb, dict) and rb.get("ok"):
+            st.markdown("### 統計摘要")
+            c1, c2, c3 = st.columns(3)
+            c1.metric("相關係數 Corr(Breadth, FutureReturn)", "-" if pd.isna(rb.get("corr")) else f"{rb.get('corr'):.3f}")
+            c2.metric("事件：指數漲但寬度差", f"{rb['evt_up_bad']['n']} 次")
+            c3.metric("事件：指數跌但寬度好", f"{rb['evt_dn_good']['n']} 次")
+
+            st.markdown("### 分位數回測（Breadth 五分位）")
+            qtbl = rb.get("qtbl", pd.DataFrame())
+            if isinstance(qtbl, pd.DataFrame) and not qtbl.empty:
+                qtbl2 = qtbl.copy()
+                qtbl2["q"] = qtbl2["q"].astype(int) + 1
+                qtbl2 = qtbl2.rename(columns={"q": "五分位(1低→5高)", "mean": "未來報酬均值(%)", "count": "樣本數", "win_rate": "勝率"})
+                st.dataframe(qtbl2, use_container_width=True)
+
+            st.markdown("### 分歧事件統計")
+            e1 = rb["evt_up_bad"]; e2 = rb["evt_dn_good"]
+            st.write(f"- 指數漲但寬度<50%：樣本 {e1['n']}，未來平均報酬 {e1['avg'] if pd.notna(e1['avg']) else '-'}，勝率 {e1['win'] if pd.notna(e1['win']) else '-'}")
+            st.write(f"- 指數跌但寬度>55%：樣本 {e2['n']}，未來平均報酬 {e2['avg'] if pd.notna(e2['avg']) else '-'}，勝率 {e2['win'] if pd.notna(e2['win']) else '-'}")
+
+            st.markdown("### 序列檢視（最近 120 筆）")
+            show_cols = ["date", "ratio", "adv", "dec", "proxy_close", rb["fwd_col"], "idx_up_breadth_bad", "idx_dn_good"] if "idx_dn_good" in df_csv.columns else []
+            # be defensive
+            show_cols = [c for c in ["date", "ratio", "adv", "dec", "proxy_close", rb["fwd_col"], "idx_up_breadth_bad", "idx_dn_breadth_good"] if c in df_csv.columns]
+            st.dataframe(df_csv[show_cols].tail(120), use_container_width=True)
+
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=df_csv["date"], y=df_csv["ratio"], name="Breadth(上漲家數比例)"))
+            fig.update_layout(height=360, margin=dict(l=10, r=10, t=10, b=10), yaxis_title="Breadth")
+            st.plotly_chart(fig, use_container_width=True)
+
+        # download csv
+        st.download_button(
+            "下載 breadth_2y.csv",
+            data=df_csv.to_csv(index=False).encode("utf-8"),
+            file_name="breadth_2y.csv",
+            mime="text/csv",
+        )
+
+    st.markdown("---")
+    st.markdown("---")
+    st.markdown("### 生成/更新 breadth_2y.csv（重運算）")
+    st.warning("此操作會重算近2年全市場寬度序列，耗時且會消耗 API 額度；建議僅在盤後或必要時執行。")
+    if st.button("生成/更新 breadth_2y.csv（近2年）", type="primary"):
+        with st.spinner("生成中：逐日計算全市場寬度（近2年）..."):
+            df = build_breadth_series_2y(token, proxy_id="0050", years=2)
+            if df is None or df.empty:
+                st.error("生成失敗：未能取得寬度序列。")
+            else:
+                save_breadth_csv(df)
+                st.success("已更新 data/breadth_2y.csv（若要多人穩定使用，請把 data/breadth_2y.csv commit 回 repo）。")
