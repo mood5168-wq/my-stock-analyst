@@ -2581,6 +2581,7 @@ def oldwang_screener(
     new_complete_filter: str = "不限",  # 不限 / 今日新三陽 / 今日新三陽(強) / 今日新四海
     new_complete_days: int = 1,
     universe_all: bool = False,
+    exclude_etf_index: bool = True,
 ) -> pd.DataFrame:
     """
     依據老王策略做選股（全市場掃描）：
@@ -2666,7 +2667,27 @@ def oldwang_screener(
         except Exception:
             pass
 
-    candidate_ids = df0["stock_id"].tolist()
+    # 去重：避免同一檔股票因資料 merge/篩選造成重複入選
+    if "stock_id" in df0.columns:
+        df0["stock_id"] = df0["stock_id"].astype(str)
+        df0 = df0.drop_duplicates(subset=["stock_id"], keep="first").copy()
+
+    # 排除 ETF/Index（避免選股器混入 0050/0052 等）
+    if exclude_etf_index:
+        try:
+            if 'stock_id' in df0.columns:
+                df0['stock_id'] = df0['stock_id'].astype(str)
+                # 移除非數字代碼（例如指數代碼字串）
+                df0 = df0[df0['stock_id'].str.match(r'^\d+$', na=False)].copy()
+                # ETF 常見代碼以 00 開頭（0050/006208/00878/0056...）
+                df0 = df0[~df0['stock_id'].str.startswith('00')].copy()
+            if 'industry_category' in df0.columns:
+                ic = df0['industry_category'].astype(str).str.lower()
+                df0 = df0[~(ic.str.contains('etf') | ic.str.contains('index'))].copy()
+        except Exception:
+            pass
+
+    candidate_ids = df0["stock_id"].drop_duplicates().tolist()
     if not candidate_ids:
         return pd.DataFrame()
 
@@ -3147,6 +3168,7 @@ def oldwang_screener(
         return pd.DataFrame()
 
     out = pd.DataFrame(rows).sort_values(["老王分數", "成交金額(億)"], ascending=[False, False]).head(int(output_top_k)).reset_index(drop=True)
+    out = out.drop_duplicates(subset=["stock_id"], keep="first").reset_index(drop=True)
     out.insert(0, "Rank", range(1, len(out) + 1))
     return out
 # -----------------------------
@@ -3997,6 +4019,15 @@ with tab6:
 
         st.caption(f"資料來源：{meta.get('source','')}；掃描日期：{meta.get('scan_date','')}")
 
+        screener_mode = st.selectbox(
+            "選股器模式",
+            options=["起漲雷達（新成立/兩段式）", "噴出雷達（大漲/漲停警示）"],
+            index=0,
+            key="ow_mode"
+        )
+        if screener_mode.startswith("噴出"):
+            st.info("噴出雷達用途：抓『今天爆拉』的股票並提示過熱風險（通常適合持有者續抱/移動停利，不適合新追價）。")
+
         st.markdown("### 盤後一鍵模式")
         if st.button("📌 套用盤後雷達模式（推薦）", key="ow_preset_postclose"):
             # 盤後建議：全市場掃描 + 今日新三陽(強) + 視窗=1天，其他條件改用表格排序挑選
@@ -4015,11 +4046,51 @@ with tab6:
             st.session_state["ow_output_top_k"] = 80
             st.session_state["ow_rs_bonus_weight"] = 6
 
+        # -----------------------------
+        # 噴出雷達：大漲/漲停（盤後警示）
+        # -----------------------------
+        if screener_mode.startswith("噴出"):
+            v_all = res.get("volume_rank", pd.DataFrame())
+            if v_all is None or v_all.empty:
+                st.error("全市場資料為空，無法產生噴出雷達。請先一鍵更新。")
+            else:
+                v = ensure_change_rate(v_all.copy())
+                money_col = None
+                for c in ["Trading_money", "total_amount", "amount"]:
+                    if c in v.columns:
+                        money_col = c
+                        break
+                if money_col is None:
+                    v["money"] = 0.0
+                    money_col = "money"
+                v[money_col] = pd.to_numeric(v[money_col], errors="coerce").fillna(0.0)
+
+                pct_th = st.slider("漲幅門檻(%)", min_value=5.0, max_value=10.0, value=9.0, step=0.5, key="pop_pct")
+                min_money = st.number_input("成交金額門檻（億）", min_value=0.0, max_value=50.0, value=1.0, step=0.5, key="pop_money")
+                pop_top = st.slider("輸出筆數", min_value=20, max_value=200, value=80, step=10, key="pop_top")
+
+                pick = v[(v["change_rate"] >= pct_th) & (v[money_col] >= float(min_money) * 1e8)].copy()
+                if pick.empty:
+                    st.info("本次條件下沒有符合的噴出股票。")
+                else:
+                    # Basic output; avoid heavy history fetch. Flag overheat by BIAS20 if available in today data, else use change_rate proxy.
+                    pick["成交金額(億)"] = pick[money_col] / 1e8
+                    cols = [c for c in ["stock_id", "stock_name", "industry_category", "change_rate", "成交金額(億)", "volume_ratio"] if c in pick.columns]
+                    show = pick.sort_values(["change_rate", "成交金額(億)"], ascending=[False, False]).head(int(pop_top)).copy()
+                    show = show.rename(columns={"change_rate": "漲跌幅(%)", "industry_category": "族群"})
+                    # Overheat hint
+                    show["風險提示"] = show["漲跌幅(%)"].apply(lambda x: "過熱（避免追價）" if pd.notna(x) and x >= 9 else "留意回測")
+                    st.dataframe(show[["stock_id","stock_name","族群","漲跌幅(%)","成交金額(億)","風險提示"] + ([ "volume_ratio"] if "volume_ratio" in show.columns else [])], use_container_width=True)
+                    st.caption("提示：噴出雷達是盤後警示清單，建議持有者用守10MA/移動停利管理；不建議新追價。")
+            st.stop()
+
+
         c1, c2, c3, c4 = st.columns(4)
         universe_top_n = c1.number_input("候選池（依成交金額前 N）", min_value=50, max_value=800, value=300, step=50, key="ow_universe_top_n")
         universe_mode_ui = st.selectbox("候選池模式", options=["成交金額TopN（較快）", "全市場（較慢）"], index=0, key="ow_universe_mode")
         output_top_k = c2.number_input("輸出 Top K", min_value=20, max_value=200, value=80, step=10, key="ow_output_top_k")
         rs_bonus_weight = st.slider("RS 加分權重（加分項）", min_value=0, max_value=10, value=6, step=1, key="ow_rs_bonus_weight")
+        exclude_etf_index_ui = st.checkbox("排除 ETF / 指數", value=True, key="ow_exclude_etf")
         market_filter_ui = st.selectbox("市場篩選", options=["全部", "上市(TSE)", "上櫃(OTC)"], index=0, key="ow_market_filter")
         strict_market_ui = st.checkbox("嚴格市場篩選（不回退）", value=True, key="ow_strict_market")
         debug_market_ui = st.checkbox("顯示市場篩選診斷", value=False, key="ow_debug_market")
@@ -4069,6 +4140,7 @@ with tab6:
                         rs_window=20,
                         rs_proxy_id='0050',
                         market_filter=market_filter,
+                        exclude_etf_index=bool(exclude_etf_index_ui) if 'exclude_etf_index_ui' in locals() else True,
                         strict_market=bool(strict_market_ui) if 'strict_market_ui' in locals() else True,
                         startup_mode=str(startup_mode_ui) if 'startup_mode_ui' in locals() else '自訂',
                         new_complete_filter=str(new_complete_ui) if 'new_complete_ui' in locals() else '不限',
@@ -4213,6 +4285,27 @@ with tab7:
 # Tab 8: 回測研究（2年）
 # -----------------------------
 with tab8:
+
+    # --- 回測研究上鎖（Streamlit Cloud 建議）---
+    backtest_key = st.secrets.get("BACKTEST_KEY", "")
+    if not backtest_key:
+        st.warning("回測研究已設定為上鎖模式，但尚未在 Secrets 設定 BACKTEST_KEY。請到 Streamlit Cloud → Settings → Secrets 加入 BACKTEST_KEY。")
+        st.stop()
+
+    if "backtest_authed" not in st.session_state:
+        st.session_state["backtest_authed"] = False
+
+    if not st.session_state["backtest_authed"]:
+        st.info("回測研究已上鎖。")
+        entered = st.text_input("輸入 BACKTEST_KEY 以解鎖回測研究", type="password", key="bt_pw")
+        if st.button("解鎖回測研究", key="unlock_bt"):
+            if entered == backtest_key:
+                st.session_state["backtest_authed"] = True
+                st.success("已解鎖回測研究。")
+            else:
+                st.error("密碼錯誤。")
+        st.stop()
+
     st.subheader("回測研究：市場寬度 vs 台股（近2年）")
 
     st.caption("建議做法（多人使用更穩）：回測預設讀取 data/breadth_2y.csv（預先計算好的寬度序列）。只有管理者才需要更新該檔案。")
