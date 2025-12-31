@@ -1956,6 +1956,7 @@ def oldwang_screener(
     universe_top_n: int = 300,
     output_top_k: int = 80,
     require_leader: bool = True,
+    startup_mode: str = "自訂",  # 自訂 / 起漲-拉回承接 / 起漲-突破發動 / 趨勢-四海遊龍續漲
     require_pattern: str = "不限",
     require_breakout: bool = False,
     min_money_yi: float = 1.0,
@@ -2119,6 +2120,18 @@ def oldwang_screener(
         rs_out_map = {}
         rs_rank_map = {}
 
+
+    # --- 主題標記（散熱/記憶體/CPO...）---
+    # 以 THEME_GROUPS 的 stocks 名單做標記；同一檔可能屬於多個主題
+    theme_tag_map = {}
+    try:
+        for _theme, _rule in THEME_GROUPS.items():
+            for _sid in (_rule.get("stocks", []) or []):
+                _sid = str(_sid)
+                theme_tag_map.setdefault(_sid, set()).add(_theme)
+    except Exception:
+        theme_tag_map = {}
+
     rows = []
     for sid in candidate_ids:
         row0 = df0[df0["stock_id"] == sid]
@@ -2176,8 +2189,24 @@ def oldwang_screener(
         bias20 = (close / ma20 - 1) * 100
 
         # 三陽開泰 / 四海遊龍
-        three = pd.notna(ma5) and pd.notna(ma10) and pd.notna(ma20) and close > ma5 and close > ma10 and close > ma20
-        four = three and pd.notna(ma60) and close > ma60
+        three = pd.notna(ma5) and pd.notna(ma10) and pd.notna(ma20) and close >= ma5 and close >= ma10 and close >= ma20
+        four = three and pd.notna(ma60) and close >= ma60
+
+        # 三陽開泰（強）：站上 MA5/10/20 + 均線多頭排列 +（MA20翻揚 或 10MA連兩日守住）
+        ma20_slope = np.nan
+        try:
+            if len(g) >= 25:
+                ma20_slope = float(g["close"].rolling(20).mean().iloc[-1] - g["close"].rolling(20).mean().iloc[-6])
+        except Exception:
+            ma20_slope = np.nan
+        hold10_two = False
+        try:
+            if pd.notna(ma10) and len(g) >= 2:
+                hold10_two = bool(g["close"].iloc[-1] >= ma10 and g["close"].iloc[-2] >= ma10)
+        except Exception:
+            hold10_two = False
+        three_strong = bool(three and pd.notna(ma5) and pd.notna(ma10) and pd.notna(ma20) and (ma5 > ma10 > ma20) and (pd.isna(ma20_slope) or ma20_slope >= 0 or hold10_two))
+
 
         # Breakout: close > prev 20-day high (exclude today)
         high_col = "max" if "max" in g.columns else "close"
@@ -2240,12 +2269,28 @@ def oldwang_screener(
         # Filters
         pass_filter_leader = (not require_leader) or leader
 
+
+        # --- 起漲模式（預設為加分/篩選）---
+        if startup_mode != "自訂":
+            if startup_mode == "起漲-拉回承接":
+                pass_filter_pattern = bool(three_strong and (bias_state != "DANGER"))
+                startup_tag = "起漲-拉回承接"
+            elif startup_mode == "起漲-突破發動":
+                pass_filter_pattern = bool(breakout_ok and (bias_state != "DANGER"))
+                startup_tag = "起漲-突破發動"
+            elif startup_mode == "趨勢-四海遊龍續漲":
+                pass_filter_pattern = bool(four and (bias_state != "DANGER"))
+                startup_tag = "趨勢-四海遊龍續漲"
+            else:
+                startup_tag = "自訂"
+
         if require_pattern == "三陽開泰":
             pass_filter_pattern = bool(three)
         elif require_pattern == "四海遊龍":
             pass_filter_pattern = bool(four)
         else:
-            pass_filter_pattern = True
+            startup_tag = "自訂"
+        pass_filter_pattern = True
 
         pass_filter_breakout = (not require_breakout) or breakout_ok
 
@@ -2333,6 +2378,14 @@ def oldwang_screener(
             elif rs_rank >= 0.6:
                 s += 1
 
+        # --- startup_mode bonus（加分項）---
+        if startup_tag == "起漲-拉回承接" and three_strong:
+            s += 4
+        elif startup_tag == "起漲-突破發動" and breakout_ok:
+            s += 5
+        elif startup_tag == "趨勢-四海遊龍續漲" and four and hold10:
+            s += 4
+
         # Clamp score
         s = max(0, min(100, s))
 
@@ -2347,6 +2400,9 @@ def oldwang_screener(
             "RS Rank(%)": round(rs_rank * 100, 1) if pd.notna(rs_rank) else np.nan,
             "BIAS20(%)": round(bias20, 2) if pd.notna(bias20) else np.nan,
             "股性": profile,
+            "起漲型態": startup_tag,
+            "三陽開泰(強)": bool(three_strong),
+            "主題標記": " / ".join(sorted(list(theme_tag_map.get(sid, set())))) if isinstance(theme_tag_map, dict) else "",
             "三陽開泰": bool(three),
             "四海遊龍": bool(four),
             "突破": bool(breakout),
@@ -3168,6 +3224,7 @@ with tab6:
         output_top_k = c2.number_input("輸出 Top K", min_value=20, max_value=200, value=80, step=10)
         rs_bonus_weight = st.slider("RS 加分權重（加分項）", min_value=0, max_value=10, value=6, step=1)
         market_filter_ui = st.selectbox("市場篩選", options=["全部", "上市(TSE)", "上櫃(OTC)"], index=0)
+        startup_mode_ui = st.selectbox("起漲模式", options=["自訂", "起漲-拉回承接", "起漲-突破發動", "趨勢-四海遊龍續漲"], index=0)
         min_money_yi = c3.number_input("成交金額門檻（億）", min_value=0.0, max_value=50.0, value=1.0, step=0.5)
         require_leader = c4.checkbox("只挑族群領導股（Top3）", value=True)
 
@@ -3206,6 +3263,7 @@ with tab6:
                         rs_window=20,
                         rs_proxy_id='0050',
                         market_filter=market_filter,
+                        startup_mode=str(startup_mode_ui) if 'startup_mode_ui' in locals() else '自訂',
                     )
                 st.session_state["oldwang_screener_df"] = df_pick
 
