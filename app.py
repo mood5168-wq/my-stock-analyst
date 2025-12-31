@@ -2582,6 +2582,7 @@ def oldwang_screener(
     new_complete_days: int = 1,
     universe_all: bool = False,
     exclude_etf_index: bool = True,
+    require_any_pattern: bool = False,
 ) -> pd.DataFrame:
     """
     依據老王策略做選股（全市場掃描）：
@@ -2844,6 +2845,12 @@ def oldwang_screener(
         three = pd.notna(ma5) and pd.notna(ma10) and pd.notna(ma20) and close >= ma5 and close >= ma10 and close >= ma20
         four = three and pd.notna(ma60) and close >= ma60
 
+        # 至少要有三陽/四海（可選過濾）
+        pass_filter_anypattern = True
+        if require_any_pattern:
+            pass_filter_anypattern = bool(three or four)
+
+
         # 三陽開泰（強）：站上 MA5/10/20 + 均線多頭排列 +（MA20翻揚 或 10MA連兩日守住）
         ma20_slope = np.nan
         try:
@@ -3011,7 +3018,7 @@ def oldwang_screener(
 
         pass_filter_breakout = (not require_breakout) or breakout_ok
 
-        if not (pass_filter_leader and pass_filter_pattern and pass_filter_breakout and pass_filter_new):
+        if not (pass_filter_leader and pass_filter_pattern and pass_filter_breakout and pass_filter_anypattern and pass_filter_new):
             continue
 
         # 新成立確認狀態（僅做標記，不硬過濾）
@@ -4009,6 +4016,27 @@ with tab5:
 with tab6:
     st.subheader("老王選股器（5/10/20/60 + 三陽開泰/四海遊龍 + 帶量突破 + 守10MA + 領導股）")
 
+    # 盤後 SOP 使用說明（內嵌備註）
+    with st.expander("盤後SOP：怎麼用選股器（超清楚版本）", expanded=False):
+        st.markdown("""
+**你要抓「今天才剛起漲」——用今日新成立（平常建議用這個）**
+1. 今日新成立過濾：**今日新三陽(強)**
+2. 新成立視窗：**1**
+3. 起漲模式：**自訂**（讓它只是標籤，不要硬篩）
+4. 用表格排序挑：
+   - 先看 **確認狀態 = 已確認**
+   - 再看 **RS、成交金額、MA20翻揚、扣抵有利**
+
+**你要抓「突破型」但不在乎是不是今天剛發生——用起漲模式**
+1. 今日新成立過濾：**不限**
+2. 起漲模式：**起漲-突破發動**
+3. 其他加分：**RS、成交金額、量比**
+
+**你要抓「可以抱的趨勢股」——用起漲模式**
+1. 今日新成立過濾：**不限**
+2. 起漲模式：**趨勢-四海遊龍續漲**
+""")
+
 
     if res is None:
         st.info("請先按左側「一鍵更新（含交易計畫引擎）」，取得全市場掃描資料後再跑選股器。")
@@ -4108,6 +4136,7 @@ with tab6:
         c5, c6 = st.columns(2)
         require_pattern = c5.selectbox("型態過濾", ["不限", "三陽開泰", "四海遊龍"], index=0, key="ow_require_pattern")
         require_breakout = c6.checkbox("只挑『突破前高且帶量』", value=False, key="ow_require_breakout")
+        require_any_pattern_ui = st.checkbox("至少要有三陽/四海（避免出現沒有型態的股票）", value=True, key="ow_any_pattern")
 
         run_btn = st.button("🚀 執行老王選股器", type="primary")
 
