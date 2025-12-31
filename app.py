@@ -1962,6 +1962,7 @@ def oldwang_screener(
     rs_proxy_id: str = "0050",
     rs_window: int = 20,
     rs_bonus_weight: int = 6,
+    market_filter: str = "ALL",  # ALL / TSE / OTC
 ) -> pd.DataFrame:
     """
     依據老王策略做選股（全市場掃描）：
@@ -2017,6 +2018,22 @@ def oldwang_screener(
 
     # Universe by money
     df0 = df0.sort_values(money_col, ascending=False).head(int(universe_top_n)).copy()
+
+    # --- 市場篩選（上市/上櫃）---
+    # 依 TaiwanStockInfo 的市場欄位做篩選；若無該欄位則忽略篩選（避免選股器報錯）
+    if market_filter in ["TSE", "OTC"]:
+        try:
+            mcol = _detect_market_col(stock_info)
+            if mcol is not None:
+                info_m = stock_info[["stock_id", mcol]].drop_duplicates().copy()
+                info_m["stock_id"] = info_m["stock_id"].astype(str)
+                info_m["_m"] = info_m[mcol].apply(_normalize_market_value)
+                df0 = df0.merge(info_m[["stock_id", "_m"]], on="stock_id", how="left")
+                df0 = df0[df0["_m"] == market_filter].copy()
+                df0 = df0.drop(columns=["_m"], errors="ignore")
+        except Exception:
+            pass
+
     candidate_ids = df0["stock_id"].tolist()
     if not candidate_ids:
         return pd.DataFrame()
@@ -3150,6 +3167,7 @@ with tab6:
         universe_top_n = c1.number_input("候選池（依成交金額前 N）", min_value=50, max_value=800, value=300, step=50)
         output_top_k = c2.number_input("輸出 Top K", min_value=20, max_value=200, value=80, step=10)
         rs_bonus_weight = st.slider("RS 加分權重（加分項）", min_value=0, max_value=10, value=6, step=1)
+        market_filter_ui = st.selectbox("市場篩選", options=["全部", "上市(TSE)", "上櫃(OTC)"], index=0)
         min_money_yi = c3.number_input("成交金額門檻（億）", min_value=0.0, max_value=50.0, value=1.0, step=0.5)
         require_leader = c4.checkbox("只挑族群領導股（Top3）", value=True)
 
@@ -3167,6 +3185,13 @@ with tab6:
                 st.error("全市場資料為空，無法選股。請確認掃描來源是否可回傳資料。")
             else:
                 with st.spinner("選股器運算中（抓取候選股近 60+ 日資料並計算訊號）..."):
+                    market_filter = "ALL"
+                    if 'market_filter_ui' in locals():
+                        if market_filter_ui.startswith('上市'):
+                            market_filter = 'TSE'
+                        elif market_filter_ui.startswith('上櫃'):
+                            market_filter = 'OTC'
+                    
                     df_pick = oldwang_screener(
                         token=token,
                         stock_info=stock_info,
@@ -3180,6 +3205,7 @@ with tab6:
                         rs_bonus_weight=int(rs_bonus_weight) if 'rs_bonus_weight' in locals() else 6,
                         rs_window=20,
                         rs_proxy_id='0050',
+                        market_filter=market_filter,
                     )
                 st.session_state["oldwang_screener_df"] = df_pick
 
