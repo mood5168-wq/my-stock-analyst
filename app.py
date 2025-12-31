@@ -2503,7 +2503,9 @@ def oldwang_screener(
             elif rs_rank >= 0.6:
                 s += 1
 
-        # --- startup_mode bonus（加分項）---
+                three_strong = three_strong if 'three_strong' in locals() else False
+        startup_tag = startup_tag if 'startup_tag' in locals() else "自訂"
+# --- startup_mode bonus（加分項）---
         if startup_tag == "起漲-拉回承接" and three_strong:
             s += 4
         elif startup_tag == "起漲-突破發動" and breakout_ok and three:
@@ -3359,7 +3361,13 @@ with tab6:
         require_leader = c4.checkbox("只挑族群領導股（Top3）", value=True)
 
         c5, c6 = st.columns(2)
-        require_pattern = c5.selectbox("型態過濾", ["不限", "三陽開泰", "四海遊龍"], index=0)
+        # 當你啟用「今日新成立過濾」時，型態過濾會自動隱藏，避免條件重複/打架
+        if str(new_complete_ui) != "不限":
+            require_pattern = "不限"
+            c5.caption("已啟用「今日新成立過濾」，型態過濾已隱藏")
+        else:
+            require_pattern = c5.selectbox("型態過濾", ["不限", "三陽開泰", "四海遊龍"], index=0)
+
         require_breakout = c6.checkbox("只挑『突破前高且帶量』", value=False)
 
         run_btn = st.button("🚀 執行老王選股器", type="primary")
