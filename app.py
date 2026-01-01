@@ -1590,7 +1590,15 @@ def compute_sector_flow_from_daily(token: str, stock_info: pd.DataFrame, date_st
     df[money_col] = to_numeric_series(df[money_col]).fillna(0.0)
 
     df = ensure_change_rate(df)
-    sign = np.sign(df["change_rate"])
+    df = ensure_change_rate(df)
+
+    # 方向：用漲跌幅符號；若缺失則視為0
+    if "change_rate" in df.columns:
+        sign = np.sign(pd.to_numeric(df["change_rate"], errors="coerce").fillna(0.0))
+    elif "spread" in df.columns:
+        sign = np.sign(pd.to_numeric(df["spread"], errors="coerce").fillna(0.0))
+    else:
+        sign = 0.0
     df["signed_money"] = df[money_col] * sign
 
     g = df.groupby("industry_category", as_index=False)["signed_money"].sum()
