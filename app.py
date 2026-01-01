@@ -151,6 +151,62 @@ def ensure_change_rate(df: pd.DataFrame) -> pd.DataFrame:
     """
     if df is None or df.empty:
         return df
+
+
+def compute_margin_usage(margin_df: pd.DataFrame) -> dict:
+    """
+    Compute financing usage rate if margin limit is available.
+    """
+    if margin_df is None or margin_df.empty or "date" not in margin_df.columns:
+        return {"ok": False}
+
+    df = margin_df.copy().sort_values("date")
+
+    bal_col = None
+    for cand in ["MarginPurchaseTodayBalance", "TodayBalance", "margin_purchase_today_balance"]:
+        if cand in df.columns:
+            bal_col = cand
+            break
+    if bal_col is None:
+        return {"ok": False}
+
+    df[bal_col] = pd.to_numeric(df[bal_col], errors="coerce")
+    balance = float(df[bal_col].iloc[-1]) if pd.notna(df[bal_col].iloc[-1]) else np.nan
+
+    lim_col = None
+    for cand in ["MarginPurchaseLimit", "MarginPurchaseLimitBalance", "FinancingLimit", "Limit", "margin_purchase_limit"]:
+        if cand in df.columns:
+            lim_col = cand
+            break
+    limit = float(df[lim_col].iloc[-1]) if (lim_col and pd.notna(df[lim_col].iloc[-1])) else np.nan
+
+    usage = np.nan
+    if pd.notna(limit) and limit > 0 and pd.notna(balance):
+        usage = float(balance / limit * 100.0)
+
+    delta_5d = np.nan
+    if len(df) >= 6 and pd.notna(df[bal_col].iloc[-6]) and pd.notna(df[bal_col].iloc[-1]):
+        delta_5d = float(df[bal_col].iloc[-1] - df[bal_col].iloc[-6])
+
+    return {"ok": True, "date": str(df["date"].iloc[-1]), "balance": balance, "limit": limit, "usage": usage, "delta_5d": delta_5d}
+
+def margin_heat_level(usage: float, is_largecap: bool) -> tuple[str, str]:
+    if usage is None or pd.isna(usage):
+        return ("N/A", "使用率資料不足（缺少融資限額欄位），改看融資餘額變化。")
+
+    if is_largecap:
+        green, yellow, red = 50, 65, 80
+    else:
+        green, yellow, red = 50, 70, 85
+
+    if usage < green:
+        return ("GREEN", "偏冷/健康：槓桿不擁擠。")
+    if usage < yellow:
+        return ("OK", "常態區：剛剛好。")
+    if usage < red:
+        return ("YELLOW", "偏熱：需要留意洗盤/急殺風險。")
+    return ("RED", "過熱/擁擠：不建議追價，需更嚴守風險控管。")
+
     df = df.copy()
 
     if "change_rate" in df.columns and not df["change_rate"].isna().all():
@@ -251,36 +307,101 @@ def _normalize_market_value(v: str) -> Optional[str]:
 
 
 # -----------------------------
-# Local-first market sets: robust TSE/OTC classification (Streamlit Cloud friendly)
+# Official market sets (TWSE ISIN): robust TSE/OTC classification
 # -----------------------------
 @st.cache_data(ttl=24 * 3600)
 def get_official_market_sets() -> dict:
-    """Read local CSV lists from repo: data/market_tse.csv, data/market_otc.csv."""
+    """
+    Robust TSE/OTC classification for Streamlit Cloud.
+
+    Priority:
+      1) Local CSV files in repo (recommended, 100% stable):
+         - data/market_tse.csv  (one column: stock_id)
+         - data/market_otc.csv  (one column: stock_id)
+
+      2) Online MOPS OpenData CSV (may fail on Streamlit Cloud due to network/blocks):
+         - https://mopsfin.twse.com.tw/opendata/t187ap03_L.csv
+         - https://mopsfin.twse.com.tw/opendata/t187ap03_O.csv
+
+    Returns {'TSE': set(codes), 'OTC': set(codes)} of 4-digit numeric codes.
+    """
+    import requests
     import pandas as pd
     import re as _re
+    from io import StringIO
+    from pathlib import Path
 
-    def _read(path: str) -> set:
-        p = Path(path)
-        if not p.exists():
+    def _read_local(path: Path) -> set:
+        try:
+            if not path.exists():
+                return set()
+            df = pd.read_csv(path)
+            col = None
+            for c in df.columns:
+                if "stock" in str(c).lower() or "代號" in str(c) or "code" in str(c).lower():
+                    col = c
+                    break
+            if col is None:
+                col = df.columns[0]
+            codes = set()
+            for v in df[col].astype(str).tolist():
+                m = _re.match(r"^\s*(\d{4})\s*$", v)
+                if m:
+                    codes.add(m.group(1))
+            return codes
+        except Exception:
             return set()
-        df = pd.read_csv(p)
-        if df is None or df.empty:
-            return set()
-        col = None
-        for c in df.columns:
-            if "stock" in str(c).lower() or "代號" in str(c) or "code" in str(c).lower():
-                col = c
-                break
-        if col is None:
-            col = df.columns[0]
-        codes = set()
-        for v in df[col].astype(str).tolist():
-            m = _re.match(r"^\s*(\d{4})\s*$", v)
-            if m:
-                codes.add(m.group(1))
-        return codes
 
-    return {"TSE": _read("data/market_tse.csv"), "OTC": _read("data/market_otc.csv")}
+    local_tse = _read_local(Path("data") / "market_tse.csv")
+    local_otc = _read_local(Path("data") / "market_otc.csv")
+    if local_tse or local_otc:
+        return {"TSE": local_tse, "OTC": local_otc}
+
+    def _fetch_csv(url: str) -> set:
+        try:
+            headers = {
+                "User-Agent": "Mozilla/5.0 (compatible; StreamlitApp/1.0)",
+                "Accept": "text/csv,text/plain,*/*",
+            }
+            r = requests.get(url, timeout=25, headers=headers)
+            text = r.text
+            if "公司代號" not in text:
+                try:
+                    r.encoding = "big5"
+                    text = r.text
+                except Exception:
+                    pass
+
+            df = pd.read_csv(StringIO(text))
+            col = None
+            for c in df.columns:
+                if "公司代號" in str(c):
+                    col = c
+                    break
+            if col is None:
+                return set()
+
+            codes = set()
+            for v in df[col].astype(str).tolist():
+                m = _re.match(r"^\s*(\d{4})\s*$", v)
+                if m:
+                    codes.add(m.group(1))
+            return codes
+        except Exception:
+            return set()
+
+    tse = _fetch_csv("https://mopsfin.twse.com.tw/opendata/t187ap03_L.csv")
+    otc = _fetch_csv("https://mopsfin.twse.com.tw/opendata/t187ap03_O.csv")
+    return {"TSE": tse, "OTC": otc}
+
+def market_by_official_set(stock_id: str) -> str:
+    s = str(stock_id).strip()
+    ms = get_official_market_sets()
+    if s in ms.get("TSE", set()):
+        return "TSE"
+    if s in ms.get("OTC", set()):
+        return "OTC"
+    return ""
 
 
 
@@ -2681,25 +2802,31 @@ def oldwang_screener(
         # --- 市場篩選（上市/上櫃）---
 
 
-    # 以本機 data/market_tse.csv、data/market_otc.csv 為準（Streamlit Cloud 不依賴外網抓名單）
+    # 使用 TWSE ISIN 官方名單辨識上市/上櫃（最穩），避免 TaiwanStockInfo 欄位不一致造成分類錯亂
 
 
     if market_filter in ["TSE", "OTC"]:
 
 
-        ms = get_official_market_sets()
+        try:
 
 
-        target_set = ms.get(market_filter, set())
+            ms = get_official_market_sets()
 
 
-        if target_set:
+            target_set = ms.get(market_filter, set())
 
 
             df0["stock_id"] = df0["stock_id"].astype(str)
 
 
             df0 = df0[df0["stock_id"].isin(target_set)].copy()
+
+
+        except Exception:
+
+
+            pass
 
 
     candidate_ids = df0["stock_id"].drop_duplicates().tolist()
@@ -3455,6 +3582,50 @@ res = st.session_state.get("result")
 # -----------------------------
 with tab1:
     st.subheader("健診：老王策略 + 籌碼分析（5/10/20/60 + 三陽開泰/四海遊龍 + 法人/融資）")
+
+    # --- 融資使用率（個股）---
+    try:
+        is_largecap = str(target_sid) in {"2330","2317","2454","2308","2412","3711","2382","2357","3008"}
+
+        m_start = (datetime.now(tz=TZ) - timedelta(days=180) if TZ else datetime.now() - timedelta(days=180)).strftime("%Y-%m-%d")
+        mdf = get_margin_cached(token, target_sid, m_start, None)
+        mu = compute_margin_usage(mdf)
+
+        if mu.get("ok"):
+            usage = mu.get("usage", np.nan)
+            level, msg = margin_heat_level(usage, is_largecap=is_largecap)
+
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("融資餘額", "-" if pd.isna(mu.get("balance")) else f"{mu.get('balance'):,.0f}")
+            c2.metric("融資5日變化", "-" if pd.isna(mu.get("delta_5d")) else f"{mu.get('delta_5d'):,.0f}")
+            c3.metric("融資使用率(%)", "-" if pd.isna(usage) else f"{usage:.1f}%")
+            c4.metric("融資熱度", level)
+            st.caption(f"{mu.get('date','')}｜{msg}")
+        else:
+            st.info("融資資料不足，無法計算使用率。")
+    except Exception:
+        st.info("融資資料暫時無法計算。")
+
+    with st.expander("融資使用率判斷標準（備註）", expanded=False):
+        st.markdown("""
+**融資使用率 = 融資餘額 / 融資限額（%）**  
+越高代表散戶槓桿越擁擠、越容易出現洗盤或踩踏。
+
+**一般股票（中小型）建議區間：**
+- 0–30%：偏冷 / 正常
+- 30–50%：剛剛好 / 常態
+- 50–70%：偏熱 / 需要警覺
+- 70–85%：過熱 / 高風險
+- 85% 以上：極端擁擠 / 隨時可能急殺
+
+**大型權值股（門檻更嚴格）：**
+- 0–50%：健康
+- 50–65%：常態
+- 65–80%：偏熱
+- 80% 以上：過熱
+
+**補充：** 若使用率資料不足（缺少融資限額欄位），請改看「融資餘額變化」與「是否連續升溫」。
+""")
     st.caption("提示：健診結論會參考 ETF 市場寬度（0050/006208 vs 00878/0056）。")
     if res is None or res.get("stock_id") != target_sid:
         st.info("請先按左側「一鍵更新（含交易計畫引擎）」取得資料。")
@@ -4030,27 +4201,6 @@ with tab5:
 with tab6:
     st.subheader("老王選股器（5/10/20/60 + 三陽開泰/四海遊龍 + 帶量突破 + 守10MA + 領導股）")
 
-    # 盤後 SOP 使用說明（內嵌備註）
-    with st.expander("盤後SOP：怎麼用選股器（超清楚版本）", expanded=False):
-        st.markdown("""
-**你要抓「今天才剛起漲」——用今日新成立（平常建議用這個）**
-1. 今日新成立過濾：**今日新三陽(強)**
-2. 新成立視窗：**1**
-3. 起漲模式：**自訂**（讓它只是標籤，不要硬篩）
-4. 用表格排序挑：
-   - 先看 **確認狀態 = 已確認**
-   - 再看 **RS、成交金額、MA20翻揚、扣抵有利**
-
-**你要抓「突破型」但不在乎是不是今天剛發生——用起漲模式**
-1. 今日新成立過濾：**不限**
-2. 起漲模式：**起漲-突破發動**
-3. 其他加分：**RS、成交金額、量比**
-
-**你要抓「可以抱的趨勢股」——用起漲模式**
-1. 今日新成立過濾：**不限**
-2. 起漲模式：**趨勢-四海遊龍續漲**
-""")
-
 
     if res is None:
         st.info("請先按左側「一鍵更新（含交易計畫引擎）」，取得全市場掃描資料後再跑選股器。")
@@ -4061,9 +4211,12 @@ with tab6:
 
         st.caption(f"資料來源：{meta.get('source','')}；掃描日期：{meta.get('scan_date','')}")
 
-        # 上市/上櫃本機名單診斷（Local-first）
-        ms_local = get_official_market_sets()
-        st.caption(f"本機名單：上市(TSE) {len(ms_local.get('TSE', set()))} 檔｜上櫃(OTC) {len(ms_local.get('OTC', set()))} 檔（若為0，請確認 data/market_tse.csv、data/market_otc.csv 已上傳）")
+        # 上市/上櫃官方名單診斷（避免名單抓取失敗導致結果為空）
+        try:
+            ms = get_official_market_sets()
+            st.caption(f"官方名單：上市(TSE) {len(ms.get('TSE', set()))} 檔｜上櫃(OTC) {len(ms.get('OTC', set()))} 檔（若為0代表官方名單抓取失敗，市場篩選會自動回退不篩選）")
+        except Exception:
+            pass
 
 
         screener_mode = st.selectbox(
