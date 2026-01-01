@@ -4072,6 +4072,14 @@ with tab6:
 
         st.caption(f"資料來源：{meta.get('source','')}；掃描日期：{meta.get('scan_date','')}")
 
+        # 上市/上櫃官方名單診斷（避免名單抓取失敗導致結果為空）
+        try:
+            ms = get_official_market_sets()
+            st.caption(f"官方名單：上市(TSE) {len(ms.get('TSE', set()))} 檔｜上櫃(OTC) {len(ms.get('OTC', set()))} 檔（若為0代表官方名單抓取失敗，市場篩選會自動回退不篩選）")
+        except Exception:
+            pass
+
+
         screener_mode = st.selectbox(
             "選股器模式",
             options=["起漲雷達（新成立/兩段式）", "噴出雷達（大漲/漲停警示）"],
