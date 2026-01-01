@@ -1572,38 +1572,59 @@ def compute_volume_ranking_from_snapshot(snapshot_all: pd.DataFrame, stock_info:
 
 
 def compute_sector_flow_from_daily(token: str, stock_info: pd.DataFrame, date_str: str) -> pd.DataFrame:
+    """Compute sector signed money flow from daily market data (robust)."""
     today_df = get_daily_all_cached(token, date_str)
-    if today_df is None or today_df.empty:
-        raise ValueError(f"無法取得 {date_str} 全市場日線資料")
+
+    # Robust coercion
+    if today_df is None:
+        return pd.DataFrame()
+    if not isinstance(today_df, pd.DataFrame):
+        try:
+            today_df = pd.DataFrame(today_df)
+        except Exception:
+            return pd.DataFrame()
+    if today_df.empty:
+        return pd.DataFrame()
 
     df = today_df.copy()
+    if "stock_id" not in df.columns:
+        return pd.DataFrame()
+
     df["stock_id"] = df["stock_id"].astype(str)
 
-    info = stock_info[["stock_id", "stock_name", "industry_category"]].drop_duplicates()
-    info["stock_id"] = info["stock_id"].astype(str)
-    df = df.merge(info, on="stock_id", how="left")
-    df["industry_category"] = df["industry_category"].fillna("其他")
+    # Merge industry info (tolerant)
+    try:
+        info = stock_info[["stock_id", "stock_name", "industry_category"]].drop_duplicates().copy()
+        info["stock_id"] = info["stock_id"].astype(str)
+        df = df.merge(info, on="stock_id", how="left")
+        if "industry_category" not in df.columns:
+            df["industry_category"] = "其他"
+        df["industry_category"] = df["industry_category"].fillna("其他")
+    except Exception:
+        df["industry_category"] = "其他"
 
+    # Money column
     money_col = "Trading_money" if "Trading_money" in df.columns else None
     if money_col is None:
-        raise ValueError("日線資料缺少 Trading_money 欄位")
-    df[money_col] = to_numeric_series(df[money_col]).fillna(0.0)
+        return pd.DataFrame()
 
-    df = ensure_change_rate(df)
+    df[money_col] = pd.to_numeric(df[money_col], errors="coerce").fillna(0.0)
+
+    # Ensure change_rate exists (best-effort)
     df = ensure_change_rate(df)
 
-    # 方向：用漲跌幅符號；若缺失則視為0
-    if "change_rate" in df.columns:
+    # Direction sign
+    if isinstance(df, pd.DataFrame) and "change_rate" in df.columns:
         sign = np.sign(pd.to_numeric(df["change_rate"], errors="coerce").fillna(0.0))
-    elif "spread" in df.columns:
+    elif isinstance(df, pd.DataFrame) and "spread" in df.columns:
         sign = np.sign(pd.to_numeric(df["spread"], errors="coerce").fillna(0.0))
     else:
         sign = 0.0
+
     df["signed_money"] = df[money_col] * sign
 
     g = df.groupby("industry_category", as_index=False)["signed_money"].sum()
     return g.sort_values("signed_money", ascending=False)
-
 
 def compute_volume_ranking_from_daily(token: str, stock_info: pd.DataFrame, dates: list[str]) -> pd.DataFrame:
     """
