@@ -248,6 +248,68 @@ def _detect_market_col(info: pd.DataFrame) -> Optional[str]:
 def _normalize_market_value(v: str) -> Optional[str]:
     if v is None:
         return None
+
+
+# -----------------------------
+# Official market sets (TWSE ISIN): robust TSE/OTC classification
+# -----------------------------
+@st.cache_data(ttl=24 * 3600)
+def get_official_market_sets() -> dict:
+    """
+    Return {'TSE': set(stock_ids), 'OTC': set(stock_ids)} from TWSE ISIN lists.
+    Uses:
+      - strMode=2: Listed (上市)
+      - strMode=4: OTC (上櫃)
+    Only keeps 4-digit numeric codes (stocks/ETFs). ETFs can be excluded later by stock_id prefix 00.
+    """
+    import requests
+    import pandas as pd
+    import re as _re
+
+    def _fetch(url: str) -> set:
+        try:
+            r = requests.get(url, timeout=25)
+            r.encoding = "big5"
+            html = r.text
+            codes = set()
+
+            # Parse via read_html if possible
+            try:
+                tables = pd.read_html(html)
+                for tb in tables:
+                    if tb.shape[1] >= 1:
+                        for v in tb.iloc[:, 0].astype(str).tolist():
+                            m = _re.match(r"^\s*(\d{4})", v)
+                            if m:
+                                codes.add(m.group(1))
+                if codes:
+                    return codes
+            except Exception:
+                pass
+
+            # Regex fallback
+            for m in _re.finditer(r">(\d{4})[ \u3000]", html):
+                codes.add(m.group(1))
+            return codes
+        except Exception:
+            return set()
+
+    return {
+        "TSE": _fetch("https://isin.twse.com.tw/isin/C_public.jsp?strMode=2"),
+        "OTC": _fetch("https://isin.twse.com.tw/isin/C_public.jsp?strMode=4"),
+    }
+
+def market_by_official_set(stock_id: str) -> str:
+    s = str(stock_id).strip()
+    ms = get_official_market_sets()
+    if s in ms.get("TSE", set()):
+        return "TSE"
+    if s in ms.get("OTC", set()):
+        return "OTC"
+    return ""
+
+
+
     s = str(v).strip().lower()
 
     # English exchange codes
@@ -2643,50 +2705,34 @@ def oldwang_screener(
         df0 = df0.sort_values(money_col, ascending=False).head(int(universe_top_n)).copy()
 
         # --- 市場篩選（上市/上櫃）---
-    # 依 TaiwanStockInfo 的市場欄位做篩選；若無該欄位則略過。
-    # strict_market=True：不回退（篩完為空就維持空，讓你知道市場辨識失敗或條件太嚴）
-    market_debug = {"mcol": None, "tse": 0, "otc": 0, "unknown": 0, "after_filter": None, "applied": False}
+
+
+    # 使用 TWSE ISIN 官方名單辨識上市/上櫃（最穩），避免 TaiwanStockInfo 欄位不一致造成分類錯亂
+
 
     if market_filter in ["TSE", "OTC"]:
+
+
         try:
-            mcol = _detect_market_col(stock_info)
-            market_debug["mcol"] = mcol
-            if mcol is not None:
-                info_m = stock_info[["stock_id", mcol]].drop_duplicates().copy()
-                info_m["stock_id"] = info_m["stock_id"].astype(str)
-                info_m["_m"] = info_m[mcol].apply(_normalize_market_value)
 
-                market_debug["tse"] = int((info_m["_m"] == "TSE").sum())
-                market_debug["otc"] = int((info_m["_m"] == "OTC").sum())
-                market_debug["unknown"] = int(info_m["_m"].isna().sum())
 
-                df0 = df0.merge(info_m[["stock_id", "_m"]], on="stock_id", how="left")
-                df0 = df0[df0["_m"] == market_filter].copy()
-                df0 = df0.drop(columns=["_m"], errors="ignore")
-                market_debug["after_filter"] = int(len(df0))
-                market_debug["applied"] = True
+            ms = get_official_market_sets()
+
+
+            target_set = ms.get(market_filter, set())
+
+
+            df0["stock_id"] = df0["stock_id"].astype(str)
+
+
+            df0 = df0[df0["stock_id"].isin(target_set)].copy()
+
+
         except Exception:
+
+
             pass
 
-    # 去重：避免同一檔股票因資料 merge/篩選造成重複入選
-    if "stock_id" in df0.columns:
-        df0["stock_id"] = df0["stock_id"].astype(str)
-        df0 = df0.drop_duplicates(subset=["stock_id"], keep="first").copy()
-
-    # 排除 ETF/Index（避免選股器混入 0050/0052 等）
-    if exclude_etf_index:
-        try:
-            if 'stock_id' in df0.columns:
-                df0['stock_id'] = df0['stock_id'].astype(str)
-                # 移除非數字代碼（例如指數代碼字串）
-                df0 = df0[df0['stock_id'].str.match(r'^\d+$', na=False)].copy()
-                # ETF 常見代碼以 00 開頭（0050/006208/00878/0056...）
-                df0 = df0[~df0['stock_id'].str.startswith('00')].copy()
-            if 'industry_category' in df0.columns:
-                ic = df0['industry_category'].astype(str).str.lower()
-                df0 = df0[~(ic.str.contains('etf') | ic.str.contains('index'))].copy()
-        except Exception:
-            pass
 
     candidate_ids = df0["stock_id"].drop_duplicates().tolist()
     if not candidate_ids:
@@ -4015,27 +4061,6 @@ with tab5:
 # -----------------------------
 with tab6:
     st.subheader("老王選股器（5/10/20/60 + 三陽開泰/四海遊龍 + 帶量突破 + 守10MA + 領導股）")
-
-    # 盤後 SOP 使用說明（內嵌備註）
-    with st.expander("盤後SOP：怎麼用選股器（超清楚版本）", expanded=False):
-        st.markdown("""
-**你要抓「今天才剛起漲」——用今日新成立（平常建議用這個）**
-1. 今日新成立過濾：**今日新三陽(強)**
-2. 新成立視窗：**1**
-3. 起漲模式：**自訂**（讓它只是標籤，不要硬篩）
-4. 用表格排序挑：
-   - 先看 **確認狀態 = 已確認**
-   - 再看 **RS、成交金額、MA20翻揚、扣抵有利**
-
-**你要抓「突破型」但不在乎是不是今天剛發生——用起漲模式**
-1. 今日新成立過濾：**不限**
-2. 起漲模式：**起漲-突破發動**
-3. 其他加分：**RS、成交金額、量比**
-
-**你要抓「可以抱的趨勢股」——用起漲模式**
-1. 今日新成立過濾：**不限**
-2. 起漲模式：**趨勢-四海遊龍續漲**
-""")
 
 
     if res is None:
