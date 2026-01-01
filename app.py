@@ -1627,62 +1627,90 @@ def compute_sector_flow_from_daily(token: str, stock_info: pd.DataFrame, date_st
     return g.sort_values("signed_money", ascending=False)
 
 def compute_volume_ranking_from_daily(token: str, stock_info: pd.DataFrame, dates: list[str]) -> pd.DataFrame:
-    """
-    Relative volume = today's volume / avg(prev 5 days volume)
-    Returns a DF that contains today's OHLC + volume_ratio + industry info
-    """
-    if len(dates) < 2:
-        raise ValueError("交易日不足，無法計算相對大量")
+    """Relative volume ranking from daily market data (robust)."""
+    if not dates or len(dates) < 2:
+        return pd.DataFrame()
 
     today = dates[-1]
     prevs = dates[:-1]
 
-    today_df = get_daily_all_cached(token, today).copy()
+    # Fetch today's market data
+    today_df = get_daily_all_cached(token, today)
+    if today_df is None:
+        return pd.DataFrame()
+    if not isinstance(today_df, pd.DataFrame):
+        try:
+            today_df = pd.DataFrame(today_df)
+        except Exception:
+            return pd.DataFrame()
+    if today_df.empty or "stock_id" not in today_df.columns:
+        return pd.DataFrame()
+
+    # Keep needed columns if they exist
     need_cols = ["stock_id", "Trading_Volume", "Trading_money", "close", "spread", "open", "max", "min"]
     keep = [c for c in need_cols if c in today_df.columns]
+    if "stock_id" not in keep:
+        return pd.DataFrame()
     today_df = today_df[keep].copy()
 
     today_df["stock_id"] = today_df["stock_id"].astype(str)
     for c in keep:
         if c != "stock_id":
-            today_df[c] = to_numeric_series(today_df[c])
+            today_df[c] = pd.to_numeric(today_df[c], errors="coerce")
 
+    # Build prev volumes
     vol_frames = []
     for d in prevs[-5:]:
-        df = get_daily_all_cached(token, d)[["stock_id", "Trading_Volume"]].copy()
-        df["stock_id"] = df["stock_id"].astype(str)
-        df["Trading_Volume"] = to_numeric_series(df["Trading_Volume"]).fillna(0.0)
-        df = df.rename(columns={"Trading_Volume": f"vol_{d}"})
-        vol_frames.append(df)
+        dfp = get_daily_all_cached(token, d)
+        if dfp is None:
+            continue
+        if not isinstance(dfp, pd.DataFrame):
+            try:
+                dfp = pd.DataFrame(dfp)
+            except Exception:
+                continue
+        if dfp.empty or "stock_id" not in dfp.columns or "Trading_Volume" not in dfp.columns:
+            continue
+        dfp = dfp[["stock_id", "Trading_Volume"]].copy()
+        dfp["stock_id"] = dfp["stock_id"].astype(str)
+        dfp["Trading_Volume"] = pd.to_numeric(dfp["Trading_Volume"], errors="coerce").fillna(0.0)
+        dfp = dfp.rename(columns={"Trading_Volume": f"vol_{d}"})
+        vol_frames.append(dfp)
 
     base = today_df.copy()
     for vf in vol_frames:
         base = base.merge(vf, on="stock_id", how="left")
 
     vol_cols = [c for c in base.columns if c.startswith("vol_")]
-    base["vol_avg_5"] = base[vol_cols].mean(axis=1, skipna=True).fillna(0.0)
+    if vol_cols:
+        base["vol_avg_5"] = base[vol_cols].mean(axis=1, skipna=True).fillna(0.0)
+    else:
+        base["vol_avg_5"] = 0.0
 
     if "Trading_Volume" in base.columns:
+        base["Trading_Volume"] = pd.to_numeric(base["Trading_Volume"], errors="coerce").fillna(0.0)
         base["volume_ratio"] = base.apply(lambda r: safe_div(r["Trading_Volume"], r["vol_avg_5"], default=0.0), axis=1)
     else:
         base["volume_ratio"] = 0.0
 
     base["volume_ratio"] = base["volume_ratio"].replace([np.inf, -np.inf], 0.0).fillna(0.0)
 
-    info = stock_info[["stock_id", "stock_name", "industry_category"]].drop_duplicates()
-    info["stock_id"] = info["stock_id"].astype(str)
-    base = base.merge(info, on="stock_id", how="left")
-    base["industry_category"] = base["industry_category"].fillna("其他")
+    # Merge stock info
+    try:
+        info = stock_info[["stock_id", "stock_name", "industry_category"]].drop_duplicates().copy()
+        info["stock_id"] = info["stock_id"].astype(str)
+        base = base.merge(info, on="stock_id", how="left")
+    except Exception:
+        base["stock_name"] = base.get("stock_name", "")
+        base["industry_category"] = base.get("industry_category", "其他")
+
+    base["industry_category"] = base.get("industry_category", "其他").fillna("其他")
     base["scan_date"] = today
 
-    # compute change_rate (for downstream tables)
+    # Ensure change_rate exists for downstream
     base = ensure_change_rate(base)
+
     return base.sort_values("volume_ratio", ascending=False)
-
-
-# -----------------------------
-# NEW (Upgrade 1): Pattern classification & Trade plan engine
-# -----------------------------
 def compute_volume_ratio_from_df(df: pd.DataFrame) -> Optional[float]:
     if df is None or df.empty or "Trading_Volume" not in df.columns:
         return None
