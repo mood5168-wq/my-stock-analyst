@@ -1808,12 +1808,32 @@ def classify_pattern(struct: dict, vol_ratio: Optional[float], profile: str) -> 
 
 
 def classify_volume_price(price_df: pd.DataFrame, vol_ratio: Optional[float]) -> dict:
+    """Classify volume/price behavior. Robust to non-DataFrame inputs."""
     out = {"label": "資料不足", "detail": ""}
-    if price_df is None or price_df.empty:
+
+    if price_df is None:
         return out
 
-    df = ensure_change_rate(price_df)
-    last = df.iloc[-1]
+    if not isinstance(price_df, pd.DataFrame):
+        try:
+            price_df = pd.DataFrame(price_df)
+        except Exception:
+            return out
+
+    if price_df.empty:
+        return out
+
+    try:
+        df = ensure_change_rate(price_df)
+        if df is None:
+            return out
+        if not isinstance(df, pd.DataFrame):
+            df = pd.DataFrame(df)
+        if df.empty:
+            return out
+        last = df.iloc[-1]
+    except Exception:
+        return out
 
     close = float(pd.to_numeric(last.get("close", np.nan), errors="coerce"))
     open_ = float(pd.to_numeric(last.get("open", np.nan), errors="coerce")) if "open" in df.columns else close
@@ -1847,12 +1867,6 @@ def classify_volume_price(price_df: pd.DataFrame, vol_ratio: Optional[float]) ->
         return {"label": "長黑K（風險）", "detail": f"單日跌幅 {chg:.2f}%、實體約 {body_pct:.2f}%：偏弱勢K棒。"}
 
     return {"label": "一般波動", "detail": "量價未出現典型突破/出貨訊號，建議搭配趨勢與關鍵價位判讀。"}
-
-
-
-# -----------------------------
-# NEW: 「老王」策略（持股判斷依據）
-# -----------------------------
 def compute_ma(df: pd.DataFrame, n: int) -> pd.Series:
     s = pd.to_numeric(df["close"], errors="coerce")
     return s.rolling(n).mean()
