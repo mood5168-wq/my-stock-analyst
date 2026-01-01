@@ -251,62 +251,36 @@ def _normalize_market_value(v: str) -> Optional[str]:
 
 
 # -----------------------------
-# Official market sets (TWSE ISIN): robust TSE/OTC classification
+# Local-first market sets: robust TSE/OTC classification (Streamlit Cloud friendly)
 # -----------------------------
 @st.cache_data(ttl=24 * 3600)
 def get_official_market_sets() -> dict:
-    """
-    Robust TSE/OTC classification using MOPS open data CSV (more reliable on Streamlit Cloud than ISIN HTML).
-      - Listed (上市): https://mopsfin.twse.com.tw/opendata/t187ap03_L.csv
-      - OTC (上櫃):   https://mopsfin.twse.com.tw/opendata/t187ap03_O.csv
-    Returns {'TSE': set(codes), 'OTC': set(codes)} of 4-digit numeric stock codes.
-    """
-    import requests
+    """Read local CSV lists from repo: data/market_tse.csv, data/market_otc.csv."""
     import pandas as pd
     import re as _re
-    from io import StringIO
 
-    def _fetch_csv(url: str) -> set:
-        try:
-            r = requests.get(url, timeout=25)
-            text = r.text
-            if "公司代號" not in text:
-                try:
-                    r.encoding = "big5"
-                    text = r.text
-                except Exception:
-                    pass
-
-            df = pd.read_csv(StringIO(text))
-            col = None
-            for c in df.columns:
-                if "公司代號" in str(c):
-                    col = c
-                    break
-            if col is None:
-                return set()
-
-            codes = set()
-            for v in df[col].astype(str).tolist():
-                m = _re.match(r"^\s*(\d{4})\s*$", v)
-                if m:
-                    codes.add(m.group(1))
-            return codes
-        except Exception:
+    def _read(path: str) -> set:
+        p = Path(path)
+        if not p.exists():
             return set()
+        df = pd.read_csv(p)
+        if df is None or df.empty:
+            return set()
+        col = None
+        for c in df.columns:
+            if "stock" in str(c).lower() or "代號" in str(c) or "code" in str(c).lower():
+                col = c
+                break
+        if col is None:
+            col = df.columns[0]
+        codes = set()
+        for v in df[col].astype(str).tolist():
+            m = _re.match(r"^\s*(\d{4})\s*$", v)
+            if m:
+                codes.add(m.group(1))
+        return codes
 
-    tse = _fetch_csv("https://mopsfin.twse.com.tw/opendata/t187ap03_L.csv")
-    otc = _fetch_csv("https://mopsfin.twse.com.tw/opendata/t187ap03_O.csv")
-    return {"TSE": tse, "OTC": otc}
-
-def market_by_official_set(stock_id: str) -> str:
-    s = str(stock_id).strip()
-    ms = get_official_market_sets()
-    if s in ms.get("TSE", set()):
-        return "TSE"
-    if s in ms.get("OTC", set()):
-        return "OTC"
-    return ""
+    return {"TSE": _read("data/market_tse.csv"), "OTC": _read("data/market_otc.csv")}
 
 
 
@@ -2707,31 +2681,25 @@ def oldwang_screener(
         # --- 市場篩選（上市/上櫃）---
 
 
-    # 使用 TWSE ISIN 官方名單辨識上市/上櫃（最穩），避免 TaiwanStockInfo 欄位不一致造成分類錯亂
+    # 以本機 data/market_tse.csv、data/market_otc.csv 為準（Streamlit Cloud 不依賴外網抓名單）
 
 
     if market_filter in ["TSE", "OTC"]:
 
 
-        try:
+        ms = get_official_market_sets()
 
 
-            ms = get_official_market_sets()
+        target_set = ms.get(market_filter, set())
 
 
-            target_set = ms.get(market_filter, set())
+        if target_set:
 
 
             df0["stock_id"] = df0["stock_id"].astype(str)
 
 
             df0 = df0[df0["stock_id"].isin(target_set)].copy()
-
-
-        except Exception:
-
-
-            pass
 
 
     candidate_ids = df0["stock_id"].drop_duplicates().tolist()
@@ -4062,6 +4030,27 @@ with tab5:
 with tab6:
     st.subheader("老王選股器（5/10/20/60 + 三陽開泰/四海遊龍 + 帶量突破 + 守10MA + 領導股）")
 
+    # 盤後 SOP 使用說明（內嵌備註）
+    with st.expander("盤後SOP：怎麼用選股器（超清楚版本）", expanded=False):
+        st.markdown("""
+**你要抓「今天才剛起漲」——用今日新成立（平常建議用這個）**
+1. 今日新成立過濾：**今日新三陽(強)**
+2. 新成立視窗：**1**
+3. 起漲模式：**自訂**（讓它只是標籤，不要硬篩）
+4. 用表格排序挑：
+   - 先看 **確認狀態 = 已確認**
+   - 再看 **RS、成交金額、MA20翻揚、扣抵有利**
+
+**你要抓「突破型」但不在乎是不是今天剛發生——用起漲模式**
+1. 今日新成立過濾：**不限**
+2. 起漲模式：**起漲-突破發動**
+3. 其他加分：**RS、成交金額、量比**
+
+**你要抓「可以抱的趨勢股」——用起漲模式**
+1. 今日新成立過濾：**不限**
+2. 起漲模式：**趨勢-四海遊龍續漲**
+""")
+
 
     if res is None:
         st.info("請先按左側「一鍵更新（含交易計畫引擎）」，取得全市場掃描資料後再跑選股器。")
@@ -4072,12 +4061,9 @@ with tab6:
 
         st.caption(f"資料來源：{meta.get('source','')}；掃描日期：{meta.get('scan_date','')}")
 
-        # 上市/上櫃官方名單診斷（避免名單抓取失敗導致結果為空）
-        try:
-            ms = get_official_market_sets()
-            st.caption(f"官方名單：上市(TSE) {len(ms.get('TSE', set()))} 檔｜上櫃(OTC) {len(ms.get('OTC', set()))} 檔（若為0代表官方名單抓取失敗，市場篩選會自動回退不篩選）")
-        except Exception:
-            pass
+        # 上市/上櫃本機名單診斷（Local-first）
+        ms_local = get_official_market_sets()
+        st.caption(f"本機名單：上市(TSE) {len(ms_local.get('TSE', set()))} 檔｜上櫃(OTC) {len(ms_local.get('OTC', set()))} 檔（若為0，請確認 data/market_tse.csv、data/market_otc.csv 已上傳）")
 
 
         screener_mode = st.selectbox(
