@@ -144,14 +144,51 @@ def safe_div(a, b, default=np.nan):
 
 
 def ensure_change_rate(df: pd.DataFrame) -> pd.DataFrame:
+    """Ensure `change_rate` exists (percentage). Always returns a DataFrame.
+
+    Common FinMind shapes:
+      - snapshot: may already contain `change_rate`
+      - daily: contains `spread` and `close`, where prev_close = close - spread
+
+    If insufficient columns exist, `change_rate` will be NaN.
     """
-    Ensure change_rate exists (%).
-    - snapshot typically has change_rate
-    - daily: compute via spread / prev_close
-    """
-    if df is None or df.empty:
+    if df is None:
+        return pd.DataFrame()
+    if not isinstance(df, pd.DataFrame):
+        try:
+            df = pd.DataFrame(df)
+        except Exception:
+            return pd.DataFrame()
+    if df.empty:
         return df
 
+    out = df.copy()
+
+    if "change_rate" in out.columns:
+        out["change_rate"] = pd.to_numeric(out["change_rate"], errors="coerce")
+        return out
+
+    # Try spread/prev_close first (daily data)
+    if "spread" in out.columns and "close" in out.columns:
+        close = pd.to_numeric(out["close"], errors="coerce")
+        spread = pd.to_numeric(out["spread"], errors="coerce")
+        prev_close = close - spread
+        with np.errstate(divide="ignore", invalid="ignore"):
+            out["change_rate"] = (spread / prev_close) * 100.0
+        out.loc[(prev_close <= 0) | (prev_close.isna()), "change_rate"] = np.nan
+        return out
+
+    # Fallback: close vs open
+    if "open" in out.columns and "close" in out.columns:
+        open_ = pd.to_numeric(out["open"], errors="coerce")
+        close = pd.to_numeric(out["close"], errors="coerce")
+        with np.errstate(divide="ignore", invalid="ignore"):
+            out["change_rate"] = (close - open_) / open_ * 100.0
+        out.loc[(open_ <= 0) | (open_.isna()), "change_rate"] = np.nan
+        return out
+
+    out["change_rate"] = np.nan
+    return out
 
 def compute_margin_usage(margin_df: pd.DataFrame) -> dict:
     """
@@ -1965,7 +2002,19 @@ def compute_oldwang_signals(stock_id: str, price_df: pd.DataFrame, profile: str)
         "washout_ignore": False,
         "notes": [],
     }
-    if price_df is None or price_df.empty or "close" not in price_df.columns:
+    # --- Input sanitation ---
+    if price_df is None:
+        out["notes"].append("缺少日線資料")
+        return out
+    if not isinstance(price_df, pd.DataFrame):
+        try:
+            price_df = pd.DataFrame(price_df)
+        except Exception:
+            out["notes"].append("日線資料格式異常")
+            return out
+    if price_df.empty or ("close" not in price_df.columns):
+        out["notes"].append("缺少日線資料")
+        return out
         out["notes"].append("缺少日線資料")
         return out
 
@@ -1974,6 +2023,9 @@ def compute_oldwang_signals(stock_id: str, price_df: pd.DataFrame, profile: str)
     if "Trading_Volume" in df.columns:
         df["Trading_Volume"] = pd.to_numeric(df["Trading_Volume"], errors="coerce")
     df = ensure_change_rate(df)
+    if df is None or (not isinstance(df, pd.DataFrame)) or df.empty:
+        out["notes"].append("日線資料不足（change_rate 計算失敗）")
+        return out
 
     # ensure chronological order for rolling calculations
     if "date" in df.columns:
