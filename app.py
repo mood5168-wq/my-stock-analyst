@@ -256,48 +256,48 @@ def _normalize_market_value(v: str) -> Optional[str]:
 @st.cache_data(ttl=24 * 3600)
 def get_official_market_sets() -> dict:
     """
-    Return {'TSE': set(stock_ids), 'OTC': set(stock_ids)} from TWSE ISIN lists.
-    Uses:
-      - strMode=2: Listed (上市)
-      - strMode=4: OTC (上櫃)
-    Only keeps 4-digit numeric codes (stocks/ETFs). ETFs can be excluded later by stock_id prefix 00.
+    Robust TSE/OTC classification using MOPS open data CSV (more reliable on Streamlit Cloud than ISIN HTML).
+      - Listed (上市): https://mopsfin.twse.com.tw/opendata/t187ap03_L.csv
+      - OTC (上櫃):   https://mopsfin.twse.com.tw/opendata/t187ap03_O.csv
+    Returns {'TSE': set(codes), 'OTC': set(codes)} of 4-digit numeric stock codes.
     """
     import requests
     import pandas as pd
     import re as _re
+    from io import StringIO
 
-    def _fetch(url: str) -> set:
+    def _fetch_csv(url: str) -> set:
         try:
             r = requests.get(url, timeout=25)
-            r.encoding = "big5"
-            html = r.text
+            text = r.text
+            if "公司代號" not in text:
+                try:
+                    r.encoding = "big5"
+                    text = r.text
+                except Exception:
+                    pass
+
+            df = pd.read_csv(StringIO(text))
+            col = None
+            for c in df.columns:
+                if "公司代號" in str(c):
+                    col = c
+                    break
+            if col is None:
+                return set()
+
             codes = set()
-
-            # Parse via read_html if possible
-            try:
-                tables = pd.read_html(html)
-                for tb in tables:
-                    if tb.shape[1] >= 1:
-                        for v in tb.iloc[:, 0].astype(str).tolist():
-                            m = _re.match(r"^\s*(\d{4})", v)
-                            if m:
-                                codes.add(m.group(1))
-                if codes:
-                    return codes
-            except Exception:
-                pass
-
-            # Regex fallback
-            for m in _re.finditer(r">(\d{4})[ \u3000]", html):
-                codes.add(m.group(1))
+            for v in df[col].astype(str).tolist():
+                m = _re.match(r"^\s*(\d{4})\s*$", v)
+                if m:
+                    codes.add(m.group(1))
             return codes
         except Exception:
             return set()
 
-    return {
-        "TSE": _fetch("https://isin.twse.com.tw/isin/C_public.jsp?strMode=2"),
-        "OTC": _fetch("https://isin.twse.com.tw/isin/C_public.jsp?strMode=4"),
-    }
+    tse = _fetch_csv("https://mopsfin.twse.com.tw/opendata/t187ap03_L.csv")
+    otc = _fetch_csv("https://mopsfin.twse.com.tw/opendata/t187ap03_O.csv")
+    return {"TSE": tse, "OTC": otc}
 
 def market_by_official_set(stock_id: str) -> str:
     s = str(stock_id).strip()
