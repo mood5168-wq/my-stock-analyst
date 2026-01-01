@@ -10,12 +10,16 @@ def fetch_codes(url: str) -> list[str]:
     r = requests.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
     r.raise_for_status()
 
-    df = pd.read_csv(StringIO(r.text))
+    # 重要：用 utf-8-sig 去掉 BOM
+    text = r.content.decode("utf-8-sig", errors="replace")
 
-    # 找「公司代號」欄位
+    df = pd.read_csv(StringIO(text))
+
+    # 找「公司代號」欄位（容錯：可能有前後空白或不可見字元）
     col = None
     for c in df.columns:
-        if "公司代號" in str(c):
+        name = str(c).strip()
+        if "公司代號" in name:
             col = c
             break
     if col is None:
