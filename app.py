@@ -3991,11 +3991,12 @@ with tab1:
                 else:
                     show_cols = ["date",
                                  "small_lt100_percent","small_lt100_percent_wow",
-                                 "big_ge100_percent","big_ge100_percent_wow",
-                                 "big_ge100_percent","big_ge100_percent_wow",
                                  "big_ge100_percent","big_ge100_percent_wow"]
                     show_cols = [c for c in show_cols if c in w_holding.columns]
-                    st.dataframe(w_holding[show_cols].tail(26), use_container_width=True)
+                    show_cols = list(dict.fromkeys(show_cols))
+                    df_show = w_holding[show_cols].copy()
+                    df_show = df_show.loc[:, ~df_show.columns.duplicated()]
+                    st.dataframe(df_show.tail(26), use_container_width=True)
 
                     figh = go.Figure()
                     if "small_lt100_percent" in w_holding.columns:
