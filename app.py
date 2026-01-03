@@ -1,4 +1,3 @@
-
 import os
 from datetime import datetime, timedelta
 from typing import Optional, Union, Iterable
@@ -12,6 +11,7 @@ import requests
 import xml.etree.ElementTree as ET
 import streamlit as st
 
+import csv
 from pathlib import Path
 import io
 import os
@@ -30,6 +30,63 @@ try:
     TZ = ZoneInfo("Asia/Taipei")
 except Exception:
     TZ = None  # fallback
+
+# -----------------------------
+# Local log helpers (Streamlit Cloud: best-effort + download)
+# -----------------------------
+def _now_taipei_str() -> str:
+    try:
+        return datetime.now(tz=TZ).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+def append_search_log(event_type: str, payload: dict) -> None:
+    """
+    Best-effort append a log row to ./data/logs/search_log.csv.
+    If filesystem is not writable, fall back to in-memory session_state.
+    """
+    row = {
+        "ts": _now_taipei_str(),
+        "event": event_type,
+        **{k: str(v) for k, v in (payload or {}).items()},
+    }
+
+    # Always keep in session for download
+    if "search_logs" not in st.session_state:
+        st.session_state["search_logs"] = []
+    st.session_state["search_logs"].append(row)
+
+    # Try to persist to file
+    try:
+        log_dir = Path("data") / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        fp = log_dir / "search_log.csv"
+        is_new = not fp.exists()
+        with fp.open("a", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=list(row.keys()))
+            if is_new:
+                w.writeheader()
+            w.writerow(row)
+    except Exception:
+        # Ignore; session_state still has logs
+        pass
+
+def download_search_log_button():
+    logs = st.session_state.get("search_logs", [])
+    if not logs:
+        st.info("目前尚無查詢紀錄。")
+        return
+    # Build CSV
+    keys = sorted({k for r in logs for k in r.keys()})
+    import io
+    buf = io.StringIO()
+    w = csv.DictWriter(buf, fieldnames=keys)
+    w.writeheader()
+    for r in logs:
+        w.writerow({k: r.get(k, "") for k in keys})
+    st.download_button("下載查詢紀錄（CSV）", data=buf.getvalue().encode("utf-8"), file_name="search_log.csv", mime="text/csv")
+
+
 
 # -----------------------------
 # Constants
@@ -573,29 +630,19 @@ def build_divergence_hint(tw: dict, oc: dict, breadth: dict) -> dict:
 
 
 # -----------------------------
-# TDCC 股權分散：散戶(1-10張) vs 大戶(>=100/500/1000張)（每週）
+# TDCC 股權分散：以「100張」為分界（每週）
 # -----------------------------
 LOT = 1000
-RETAIL_LOW = 1 * LOT
-RETAIL_HIGH = 10 * LOT
-BIG_100 = 100 * LOT
-BIG_500 = 500 * LOT
-BIG_1000 = 1000 * LOT
+BIG_100 = 100 * LOT  # 100張 = 100,000 股
 
 def _parse_level_range(level: str):
     """
     Parse HoldingSharesLevel to (lower, upper) in shares.
-    Examples:
-      '1-999'
-      '1,000-5,000'
-      '1,000,001-999,999,999'
-      '1,000,001以上'
     """
     if level is None:
         return (np.nan, np.nan)
     s = str(level).strip()
 
-    # '以上'
     if "以上" in s:
         m = re.search(r"[\d,]+", s)
         if not m:
@@ -629,11 +676,11 @@ def get_holding_shares_per_cached(token: str, stock_id: str, start_date: str) ->
         df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
     return df
 
-def build_retail_big_weekly(token: str, stock_id: str, start_date: str = "2019-01-01") -> pd.DataFrame:
+def build_holder_split_weekly(token: str, stock_id: str, start_date: str = "2019-01-01") -> pd.DataFrame:
     """
-    Weekly holding structure:
-      retail: 1-10 lots (1,000-10,000 shares)
-      big: >=100/500/1000 lots (>=100k/500k/1M shares)
+    Weekly split by 100-lot boundary:
+      - small: <100 lots
+      - big:   >=100 lots
     Returns percent/people and WoW diffs.
     """
     df = get_holding_shares_per_cached(token, stock_id, start_date)
@@ -646,10 +693,8 @@ def build_retail_big_weekly(token: str, stock_id: str, start_date: str = "2019-0
         if c in d.columns:
             d[c] = pd.to_numeric(d[c], errors="coerce")
 
-    retail = d[(d["lo"] >= RETAIL_LOW) & (d["hi"] <= RETAIL_HIGH)].copy()
-    big100 = d[d["lo"] >= BIG_100].copy()
-    big500 = d[d["lo"] >= BIG_500].copy()
-    big1000 = d[d["lo"] >= BIG_1000].copy()
+    small = d[(d["hi"] < BIG_100)].copy()
+    big = d[(d["lo"] >= BIG_100) | ((d["lo"] < BIG_100) & (d["hi"] >= BIG_100))].copy()
 
     def _agg(x: pd.DataFrame, prefix: str) -> pd.DataFrame:
         if x.empty:
@@ -660,24 +705,22 @@ def build_retail_big_weekly(token: str, stock_id: str, start_date: str = "2019-0
         )
         return g.rename(columns={"people": f"{prefix}_people", "percent": f"{prefix}_percent"})
 
-    out = _agg(retail, "retail_1_10")
-    for pref, chunk in [("big_100", big100), ("big_500", big500), ("big_1000", big1000)]:
-        out = out.merge(_agg(chunk, pref), on="date", how="outer")
-
+    out = _agg(small, "small_lt100").merge(_agg(big, "big_ge100"), on="date", how="outer")
     out = out.sort_values("date").reset_index(drop=True)
 
-    # WoW changes
-    for pref in ["retail_1_10", "big_100", "big_500", "big_1000"]:
+    for pref in ["small_lt100", "big_ge100"]:
         if f"{pref}_people" in out.columns:
             out[f"{pref}_people_wow"] = out[f"{pref}_people"].diff()
         if f"{pref}_percent" in out.columns:
             out[f"{pref}_percent_wow"] = out[f"{pref}_percent"].diff()
+
     return out
 
+# Backward-compatible alias
+def build_retail_big_weekly(token: str, stock_id: str, start_date: str = "2019-01-01") -> pd.DataFrame:
+    return build_holder_split_weekly(token, stock_id, start_date=start_date)
+
 def _streak(series: pd.Series, direction: str = "up") -> int:
-    """
-    Count consecutive weeks at the end where diff is >0 (up) or <0 (down).
-    """
     if series is None or series.empty:
         return 0
     s = pd.to_numeric(series, errors="coerce").dropna()
@@ -695,37 +738,29 @@ def _streak(series: pd.Series, direction: str = "up") -> int:
     return cnt
 
 def compute_holding_signal(w: pd.DataFrame) -> dict:
-    """
-    Return a compact signal dict for health/decision:
-      - latest percents
-      - WoW deltas
-      - streaks (big up / retail down)
-      - light: GREEN/YELLOW/RED
-    """
     if w is None or w.empty:
         return {"ok": False, "light": "N/A", "msg": "無股權分散資料"}
+
     last = w.iloc[-1]
+
     def _g(name, default=np.nan):
         return float(last[name]) if name in w.columns and pd.notna(last[name]) else default
 
-    big1000_wow = _g("big_1000_percent_wow", 0.0)
-    big500_wow = _g("big_500_percent_wow", 0.0)
-    retail_wow = _g("retail_1_10_percent_wow", 0.0)
+    big_wow = _g("big_ge100_percent_wow", 0.0)
+    small_wow = _g("small_lt100_percent_wow", 0.0)
 
-    big1000_streak = _streak(w.get("big_1000_percent", pd.Series(dtype=float)), "up")
-    big500_streak = _streak(w.get("big_500_percent", pd.Series(dtype=float)), "up")
-    retail_down_streak = _streak(w.get("retail_1_10_percent", pd.Series(dtype=float)), "down")
+    big_up_weeks = _streak(w.get("big_ge100_percent", pd.Series(dtype=float)), "up")
+    small_down_weeks = _streak(w.get("small_lt100_percent", pd.Series(dtype=float)), "down")
 
-    # Light rules (simple & interpretable)
-    green = ((big500_wow > 0) or (big1000_wow > 0)) and (retail_wow < 0)
-    red = ((big500_wow < 0) and (big1000_wow < 0)) and (retail_wow > 0)
+    green = (big_wow > 0) and (small_wow < 0)
+    red = (big_wow < 0) and (small_wow > 0)
 
     if green:
         light = "GREEN"
-        msg = "大戶比例上升、散戶比例下降（結構偏健康）"
+        msg = "大戶(≥100張)比例上升、散戶(<100張)比例下降（結構偏健康）"
     elif red:
         light = "RED"
-        msg = "大戶比例下降、散戶比例上升（結構偏弱/分散）"
+        msg = "大戶(≥100張)比例下降、散戶(<100張)比例上升（結構偏弱/分散）"
     else:
         light = "YELLOW"
         msg = "結構中性（需搭配法人/融資與型態）"
@@ -735,17 +770,10 @@ def compute_holding_signal(w: pd.DataFrame) -> dict:
         "light": light,
         "msg": msg,
         "date": str(last.get("date", "")),
-        "retail_pct": _g("retail_1_10_percent"),
-        "retail_wow": retail_wow,
-        "big100_pct": _g("big_100_percent"),
-        "big100_wow": _g("big_100_percent_wow", 0.0),
-        "big500_pct": _g("big_500_percent"),
-        "big500_wow": big500_wow,
-        "big1000_pct": _g("big_1000_percent"),
-        "big1000_wow": big1000_wow,
-        "big500_up_weeks": big500_streak,
-        "big1000_up_weeks": big1000_streak,
-        "retail_down_weeks": retail_down_streak,
+        "big_wow": big_wow,
+        "small_wow": small_wow,
+        "big_up_weeks": big_up_weeks,
+        "small_down_weeks": small_down_weeks,
     }
 
 
@@ -1988,7 +2016,7 @@ def compute_oldwang_signals(stock_id: str, price_df: pd.DataFrame, profile: str)
     """
     老王策略檢核：
       - 均線策略：5/10判斷極短線強弱；20判斷多頭趨勢
-      - 形態：三陽開泰（站上5/10/20）、四海遊龍（站上所有短中期均線）
+      - 形態：三陽開泰（站上5/10/20）、四海遊龍（站上5/10/20/60 + 均線多頭排列）
       - 量價：突破前高需帶量；大量後不應快速縮量
       - 一條線策略：大型主流/特定題材（記憶體/面板等）用10MA守線，不破續抱
       - 無視單一K棒：若未破關鍵支撐，不因單日長黑就判死刑
@@ -1998,7 +2026,7 @@ def compute_oldwang_signals(stock_id: str, price_df: pd.DataFrame, profile: str)
         "ma20_slope": np.nan, "ma20_turn_up": None, "hold_ma10_2d": None,
         "above_ma5": None, "above_ma10": None, "above_ma20": None, "above_ma60": None,
         "tri": False, "tri_strong": False, "four": False,
-        "key_ma": 10, "key_hold": False, "key_break_2d": False,
+        "key_ma": 10, "key_hold": False, "key_break_1d": False, "key_break_2d": False, "key_state": "N/A",
         "breakout_need_volume": False, "post_surge_volume_ok": None,
         "washout_ignore": False,
         "notes": [],
@@ -2081,28 +2109,48 @@ def compute_oldwang_signals(stock_id: str, price_df: pd.DataFrame, profile: str)
         out["tri_strong"] = bool(out["tri"] and (ma5 > ma10 > ma20) and ((out["ma20_turn_up"] is True) or (out["hold_ma10_2d"] is True)))
 
     if pd.notna(close) and all(pd.notna(x) for x in [ma5, ma10, ma20, ma60]):
-        out["four"] = out["tri"] and (close >= ma60)
+        out["four"] = out["tri"] and (close >= ma60) and (ma5 > ma10 > ma20 > ma60)
 
     # If user feels "above all MAs" but signals are off, this note explains the short MA gate
     if (not out["tri"] or not out["four"]) and pd.notna(close) and pd.notna(ma20) and pd.notna(ma60):
         if (close >= ma20) and (close >= ma60) and ((pd.notna(ma5) and close < ma5) or (pd.notna(ma10) and close < ma10)):
             out["notes"].append("價格在20/60MA之上，但尚未重新站回5/10MA，因此三陽開泰/四海遊龍未成立")
 
-    # 一條線策略：預設大型權值股與記憶體/面板主題用 10MA
-    if profile == "大型權值股" or hit_theme(stock_id, "記憶體族群") or hit_theme(stock_id, "面板族群"):
+    # 均線防守法則（預設採「2日收盤確認」，避免被洗）
+    # - 大型權值股：月線(20MA)為主要操作依據
+    # - 記憶體/面板等主流題材：一條線策略以10MA為主（不易被短線震盪洗出）
+    # - 其餘：若屬極強勢（三陽開泰強勢版）可先守5MA；否則以10MA為波段生命線
+    if profile == "大型權值股":
+        out["key_ma"] = 20
+    elif hit_theme(stock_id, "記憶體族群") or hit_theme(stock_id, "面板族群"):
         out["key_ma"] = 10
+    elif out.get("tri_strong"):
+        out["key_ma"] = 5
     else:
         out["key_ma"] = 10
 
-    # keyline hold/break（避免被洗：用「連兩日」才算有效跌破）
-    if len(df) >= 2 and pd.notna(df["MA10"].iloc[-1]) and pd.notna(df["MA10"].iloc[-2]):
+    key_col = f"MA{int(out.get('key_ma', 10))}"
+    if key_col not in df.columns:
+        # fallback（資料不足時）
+        key_col = "MA10" if "MA10" in df.columns else ("MA20" if "MA20" in df.columns else "MA5")
+
+    # keyline hold/break（避免被洗：用「連兩日收盤」才算有效跌破）
+    if len(df) >= 2 and (key_col in df.columns) and pd.notna(df[key_col].iloc[-1]) and pd.notna(df[key_col].iloc[-2]):
         c1 = float(df["close"].iloc[-1])
         c2 = float(df["close"].iloc[-2])
-        m1 = float(df["MA10"].iloc[-1])
-        m2 = float(df["MA10"].iloc[-2])
+        m1 = float(df[key_col].iloc[-1])
+        m2 = float(df[key_col].iloc[-2])
 
-        out["key_hold"] = (c1 >= m1)
-        out["key_break_2d"] = (c1 < m1) and (c2 < m2)
+        out["key_hold"] = bool(c1 >= m1)
+        out["key_break_1d"] = bool(c1 < m1)
+        out["key_break_2d"] = bool((c1 < m1) and (c2 < m2))
+
+        if out["key_break_2d"]:
+            out["key_state"] = "轉弱(跌破2日)"
+        elif out["key_break_1d"]:
+            out["key_state"] = "警訊(跌破1日)"
+        else:
+            out["key_state"] = "OK"
 
     # 量價：突破前高必須帶量（用20日區間前高 + 相對量）
     high_col = _get_col(df, ["max", "high"]) or "close"
@@ -2137,10 +2185,14 @@ def compute_oldwang_signals(stock_id: str, price_df: pd.DataFrame, profile: str)
                 out["notes"].append("大量後快速縮量（反轉風險提高）")
 
     # 無視單一K棒：若單日長黑但未破10MA/20MA關鍵支撐，視為洗盤可能
+    key_ma = int(out.get("key_ma", 10))
+    key_col = f"MA{key_ma}"
+    key_today = float(df[key_col].iloc[-1]) if (key_col in df.columns and pd.notna(df[key_col].iloc[-1])) else np.nan
+
     if pd.notna(df["change_rate"].iloc[-1]) and float(df["change_rate"].iloc[-1]) <= -3.0:
-        if pd.notna(ma10) and close >= ma10:
+        if pd.notna(key_today) and close >= key_today:
             out["washout_ignore"] = True
-            out["notes"].append("出現長黑但仍守住10MA：偏洗盤，勿因單一K棒翻空")
+            out["notes"].append(f"出現長黑但仍守住{key_ma}MA：偏洗盤，勿因單一K棒翻空")
 
     # 訊號整理
     if out["tri_strong"]:
@@ -2149,10 +2201,13 @@ def compute_oldwang_signals(stock_id: str, price_df: pd.DataFrame, profile: str)
         out["notes"].append("形態：三陽開泰（站上5/10/20）")
     if out["four"]:
         out["notes"].append("形態：四海遊龍（站上短中期均線）")
-    if out["key_break_2d"]:
-        out["notes"].append("一條線策略：連兩日跌破10MA（續抱條件失效）")
-    elif out["key_hold"]:
-        out["notes"].append("一條線策略：守住10MA（可續抱/偏多）")
+    key_ma = int(out.get("key_ma", 10))
+    if out.get("key_break_2d"):
+        out["notes"].append(f"均線防守：連兩日跌破{key_ma}MA（續抱條件失效）")
+    elif out.get("key_break_1d"):
+        out["notes"].append(f"均線防守：收盤跌破{key_ma}MA（第1日，需次日確認）")
+    elif out.get("key_hold"):
+        out["notes"].append(f"均線防守：守住{key_ma}MA（可續抱/偏多）")
 
     return out
 
@@ -2171,6 +2226,8 @@ def compose_oldwang_decision(
     """
     action = "等待"
     reasons: list[str] = []
+    key_ma = int(oldwang.get("key_ma", 10)) if isinstance(oldwang, dict) else 10
+
 
     # 反向警訊（手動）
     if contrarian_flag:
@@ -2207,7 +2264,7 @@ def compose_oldwang_decision(
         # 一條線策略：連兩日破10MA -> 續抱條件失效
         if oldwang.get("key_break_2d"):
             action = "減碼/出場"
-            reasons.append("一條線策略失守：連兩日跌破10MA，續抱條件失效")
+            reasons.append(f"均線防守失守：連兩日跌破MA{key_ma}（2日收盤確認），續抱條件失效")
         else:
             # 乖離過大：禁止追高（持股以不加碼為主）
             if bias_level == "danger":
@@ -2228,7 +2285,7 @@ def compose_oldwang_decision(
                     reasons.append("型態成立但籌碼未同步：續抱觀察，不加碼")
                 else:
                     action = "續抱觀察"
-                    reasons.append("尚未明確轉空：先守10MA/20MA，等待型態與籌碼明朗")
+                    reasons.append(f"尚未明確轉空：先守關鍵均線 MA{key_ma}（跌破2日才算），等待型態與籌碼明朗")
 
     # -------- 非持股模式：是否進場 --------
     else:
@@ -2257,7 +2314,7 @@ def compose_oldwang_decision(
     if oldwang.get("post_surge_volume_ok") is False:
         reasons.append("量價風險：大量後快速縮量，留意反轉")
     if oldwang.get("washout_ignore"):
-        reasons.append("無視單一K棒：長黑但守住10MA，偏洗盤，勿因單日翻空")
+        reasons.append(f"無視單一K棒：長黑但守住MA{key_ma}，偏洗盤，勿因單日翻空")
 
     return {"action": action, "reasons": reasons}
 
@@ -3650,7 +3707,13 @@ if not token:
     st.stop()
 
 st.sidebar.header("參數")
-target_sid = st.sidebar.text_input("個股代碼", value="2330").strip()
+target_sid = st.sidebar.text_input("個股代碼", value="2330", key="stock_input").strip()
+
+# Log: stock search input change
+_prev = st.session_state.get("_prev_stock_input", None)
+if _prev != target_sid and target_sid:
+    append_search_log("stock_input", {"stock_id": target_sid})
+    st.session_state["_prev_stock_input"] = target_sid
 scan_mode = st.sidebar.selectbox("全市場掃描來源", options=["即時快照（推薦）", "日線（收盤資料）"], index=0)
 
 st.sidebar.divider()
@@ -3830,12 +3893,15 @@ with tab1:
             n1, n2, n3, n4, n5, n6, n7, n8 = st.columns(8)
             n1.metric("最新價", f"{close:.2f}")
             n2.metric("資料日期", patch_date)
-            n3.metric("MA10（守線）", "-" if pd.isna(ma10) else f"{ma10:.2f}")
+            key_ma_ui = int(ow.get("key_ma", 10)) if isinstance(ow, dict) else 10
+            key_val_ui = {5: ma5, 10: ma10, 20: ma20}.get(key_ma_ui, ma10)
+            n3.metric(f"守線 MA{key_ma_ui}（2日）", "-" if pd.isna(key_val_ui) else f"{key_val_ui:.2f}")
             n4.metric("MA20", "-" if pd.isna(ma20) else f"{ma20:.2f}")
             n5.metric("MA60", "-" if pd.isna(ma60) else f"{ma60:.2f}")
             n6.metric("20MA乖離(%)", "-" if pd.isna(bias20) else f"{bias20:.2f}%")
             n7.metric("法人5日合計", "-" if chip.get("net_5d_total") is None else f"{float(chip.get('net_5d_total')):,.0f}")
             n8.metric("融資5日變化", "-" if chip.get("margin_delta_5d") is None else f"{float(chip.get('margin_delta_5d')):,.0f}")
+            st.caption(f"守線採 2 日收盤確認（避免被洗）：{ow.get('key_state', '-')}｜跌破2日才視為失守。")
 
             if vol_ratio is not None and not pd.isna(vol_ratio):
                 st.caption(f"相對量（今/近5日均量）：{float(vol_ratio):.2f}")
@@ -3905,17 +3971,17 @@ with tab1:
             # --- 技術圖（加上 5/10/20/60） ---
             
             # --- 大戶 vs 散戶（每週股權分散）---
-            st.markdown("### 籌碼結構：大戶 vs 散戶（每週）")
+            st.markdown("### 籌碼結構：大戶 vs 散戶（每週，100張分界）")
             w_holding = build_retail_big_weekly(token, target_sid, start_date="2019-01-01")
             sig_h = compute_holding_signal(w_holding)
 
             if sig_h.get("ok"):
                 k1, k2, k3, k4 = st.columns(4)
                 k1.metric("籌碼結構燈號", sig_h["light"])
-                k2.metric("大戶>=500張 WoW(%)", f"{sig_h['big500_wow']:+.2f}")
-                k3.metric("大戶>=1000張 WoW(%)", f"{sig_h['big1000_wow']:+.2f}")
-                k4.metric("散戶1-10張 WoW(%)", f"{sig_h['retail_wow']:+.2f}")
-                st.caption(f"{sig_h['date']}｜{sig_h['msg']}｜連續週數：大戶>=500 ↑{sig_h['big500_up_weeks']}、大戶>=1000 ↑{sig_h['big1000_up_weeks']}、散戶(1-10) ↓{sig_h['retail_down_weeks']}")
+                k2.metric("大戶≥100張 WoW(%)", f"{sig_h['big_wow']:+.2f}")
+                k3.metric("大戶≥100張 WoW(%)", f"{sig_h['big_wow']:+.2f}")
+                k4.metric("散戶<100張 WoW(%)", f"{sig_h['small_wow']:+.2f}")
+                st.caption(f"{sig_h['date']}｜{sig_h['msg']}｜連續週數：大戶>=500 ↑{sig_h['big_up_weeks']}、大戶>=1000 ↑{sig_h['big_up_weeks']}、散戶(1-10) ↓{sig_h['small_down_weeks']}")
             else:
                 st.info("無法取得股權分散資料（可能該股資料不足或資料源暫時不可用）。")
 
@@ -3924,22 +3990,18 @@ with tab1:
                     st.info("本股無股權分散資料。")
                 else:
                     show_cols = ["date",
-                                 "retail_1_10_percent","retail_1_10_percent_wow",
-                                 "big_100_percent","big_100_percent_wow",
-                                 "big_500_percent","big_500_percent_wow",
-                                 "big_1000_percent","big_1000_percent_wow"]
+                                 "small_lt100_percent","small_lt100_percent_wow",
+                                 "big_ge100_percent","big_ge100_percent_wow",
+                                 "big_ge100_percent","big_ge100_percent_wow",
+                                 "big_ge100_percent","big_ge100_percent_wow"]
                     show_cols = [c for c in show_cols if c in w_holding.columns]
                     st.dataframe(w_holding[show_cols].tail(26), use_container_width=True)
 
                     figh = go.Figure()
-                    if "retail_1_10_percent" in w_holding.columns:
-                        figh.add_trace(go.Scatter(x=w_holding["date"], y=w_holding["retail_1_10_percent"], name="散戶(1-10張)%"))
-                    if "big_100_percent" in w_holding.columns:
-                        figh.add_trace(go.Scatter(x=w_holding["date"], y=w_holding["big_100_percent"], name="大戶(>=100張)%"))
-                    if "big_500_percent" in w_holding.columns:
-                        figh.add_trace(go.Scatter(x=w_holding["date"], y=w_holding["big_500_percent"], name="大戶(>=500張)%"))
-                    if "big_1000_percent" in w_holding.columns:
-                        figh.add_trace(go.Scatter(x=w_holding["date"], y=w_holding["big_1000_percent"], name="大戶(>=1000張)%"))
+                    if "small_lt100_percent" in w_holding.columns:
+                        figh.add_trace(go.Scatter(x=w_holding["date"], y=w_holding["small_lt100_percent"], name="散戶(1-10張)%"))
+                    if "big_ge100_percent" in w_holding.columns:
+                        figh.add_trace(go.Scatter(x=w_holding["date"], y=w_holding["big_ge100_percent"], name="大戶(>=100張)%"))
                     figh.update_layout(height=420, margin=dict(l=10, r=10, t=10, b=10))
                     st.plotly_chart(figh, use_container_width=True)
 
@@ -4323,6 +4385,22 @@ with tab5:
 # Tab 6
 # -----------------------------
 with tab6:
+
+    # --- 老王選股器上鎖（密碼保護）---
+    screener_key = st.secrets.get("SCREENER_KEY", "")
+    if screener_key:
+        if "screener_authed" not in st.session_state:
+            st.session_state["screener_authed"] = False
+        if not st.session_state["screener_authed"]:
+            st.info("老王選股器已上鎖。")
+            entered = st.text_input("輸入 SCREENER_KEY 以解鎖選股器", type="password", key="screener_pw")
+            if st.button("解鎖選股器", key="unlock_screener"):
+                if entered == screener_key:
+                    st.session_state["screener_authed"] = True
+                    st.success("已解鎖。")
+                else:
+                    st.error("密碼錯誤。")
+            st.stop()
     st.subheader("老王選股器（5/10/20/60 + 三陽開泰/四海遊龍 + 帶量突破 + 守10MA + 領導股）")
 
 
@@ -4440,6 +4518,7 @@ with tab6:
             st.session_state["oldwang_screener_df"] = pd.DataFrame()
 
         if run_btn:
+            append_search_log("screener_run", {"mode": str(st.session_state.get("ow_mode","")), "market": str(st.session_state.get("ow_market_filter","")), "new_filter": str(st.session_state.get("ow_new_complete","")), "days": str(st.session_state.get("ow_new_days","")), "top_n": str(st.session_state.get("ow_universe_top_n","")), "top_k": str(st.session_state.get("ow_output_top_k",""))})
             if vol_rank is None or vol_rank.empty:
                 st.error("全市場資料為空，無法選股。請確認掃描來源是否可回傳資料。")
             else:
@@ -4506,6 +4585,11 @@ with tab6:
 # -----------------------------
 # Tab 7: 宏觀追蹤
 # -----------------------------
+
+    st.markdown("---")
+    st.subheader("查詢紀錄")
+    download_search_log_button()
+
 with tab7:
     st.subheader("宏觀追蹤（美國經濟數據日曆 + 美股ETF收盤 + 台灣ETF市場寬度）")
 
