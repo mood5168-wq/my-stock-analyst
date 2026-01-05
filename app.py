@@ -20,6 +20,15 @@ import os
 # Streamlit config
 # -----------------------------
 st.set_page_config(page_title="超級分析師-Pro（七大功能 + 第八分類 + 交易計畫引擎）", layout="wide")
+
+# Sidebar: show last API warnings (if any)
+with st.sidebar.expander("API/資料源警示", expanded=False):
+    errs = st.session_state.get("_api_errors", [])
+    if not errs:
+        st.caption("目前無警示。")
+    else:
+        for msg in errs[-8:]:
+            st.write("- " + str(msg))
 st.title("超級分析師-Pro（七大功能 + 第八分類 + 交易計畫引擎）")
 
 # -----------------------------
@@ -150,7 +159,9 @@ def finmind_get_data(
     data_id: Optional[Union[str, Iterable[str]]] = None,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
-    timeout: int = 30,
+    timeout: int = 45,
+    max_retries: int = 2,
+    backoff: float = 0.8,
 ) -> pd.DataFrame:
     params = {"dataset": dataset}
     did = _as_data_id_param(data_id)
@@ -161,11 +172,32 @@ def finmind_get_data(
     if end_date:
         params["end_date"] = end_date
 
-    resp = requests.get(FINMIND_DATA_URL, headers=_headers(token), params=params, timeout=timeout)
-    resp.raise_for_status()
-    payload = resp.json()
-    _raise_if_api_error(payload, f"dataset={dataset}")
-    return pd.DataFrame(payload.get("data", []))
+    last_exc = None
+    for attempt in range(max_retries + 1):
+        try:
+            resp = requests.get(FINMIND_DATA_URL, headers=_headers(token), params=params, timeout=timeout)
+            resp.raise_for_status()
+            payload = resp.json()
+            _raise_if_api_error(payload, f"dataset={dataset}")
+            return pd.DataFrame(payload.get("data", []))
+        except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectionError, requests.exceptions.ChunkedEncodingError) as e:
+            last_exc = e
+        except Exception:
+            raise
+
+        if attempt < max_retries:
+            try:
+                import time as _time
+                _time.sleep(backoff * (2 ** attempt))
+            except Exception:
+                pass
+
+    # Exhausted retries: return empty to keep app stable
+    try:
+        st.session_state.setdefault("_api_errors", []).append(f"{_now_taipei_str()} finmind_get_data timeout dataset={dataset}")
+    except Exception:
+        pass
+    return pd.DataFrame()
 
 
 def finmind_tick_snapshot(
@@ -1148,10 +1180,93 @@ def backtest_breadth_vs_index(df: pd.DataFrame, horizon: int = 5) -> dict:
 
     return {"ok": True, "fwd_col": fwd_col, "corr": corr, "qtbl": qtbl, "evt_up_bad": evt1, "evt_dn_good": evt2}
 
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
 def get_stock_info_cached(token: str) -> pd.DataFrame:
-    return finmind_get_data(token, dataset="TaiwanStockInfo", timeout=30)
+    """Get TaiwanStockInfo with retries; fallback to local market CSV if API is slow."""
 
+    def _ensure_schema(df: pd.DataFrame) -> pd.DataFrame:
+        if df is None:
+            df = pd.DataFrame()
+        if not isinstance(df, pd.DataFrame):
+            try:
+                df = pd.DataFrame(df)
+            except Exception:
+                df = pd.DataFrame()
+        if df.empty:
+            return pd.DataFrame(columns=["stock_id", "stock_name", "industry_category", "market"])
+        out = df.copy()
+        if "stock_id" in out.columns:
+            out["stock_id"] = out["stock_id"].astype(str)
+        else:
+            out["stock_id"] = ""
+        if "stock_name" not in out.columns:
+            if "name" in out.columns:
+                out["stock_name"] = out["name"].astype(str)
+            else:
+                out["stock_name"] = ""
+        if "industry_category" not in out.columns:
+            out["industry_category"] = "其他"
+        if "market" not in out.columns:
+            out["market"] = ""
+        out["industry_category"] = out["industry_category"].fillna("其他")
+        out["stock_name"] = out["stock_name"].fillna("")
+        out["market"] = out["market"].fillna("")
+        return out
 
+    def _fallback_from_local() -> pd.DataFrame:
+        rows = []
+        for mkt, fp in [("TSE", Path("data") / "market_tse.csv"), ("OTC", Path("data") / "market_otc.csv")]:
+            if not fp.exists():
+                continue
+            try:
+                dfm = pd.read_csv(fp)
+                code_col = None
+                for c in dfm.columns:
+                    cl = str(c).lower()
+                    if "stock" in cl or "代號" in str(c) or "code" in cl:
+                        code_col = c
+                        break
+                if code_col is None:
+                    code_col = dfm.columns[0]
+
+                name_col = None
+                for c in dfm.columns:
+                    if "簡稱" in str(c) or "名稱" in str(c) or str(c).lower() in {"stock_name", "name"}:
+                        name_col = c
+                        break
+
+                for _, r in dfm.iterrows():
+                    sid = str(r.get(code_col, "")).strip()
+                    if not re.match(r"^\d{4}$", sid):
+                        continue
+                    sname = ""
+                    if name_col is not None:
+                        sname = str(r.get(name_col, "")).strip()
+                    rows.append({"stock_id": sid, "stock_name": sname, "industry_category": "其他", "market": mkt})
+            except Exception:
+                continue
+        if not rows:
+            return pd.DataFrame(columns=["stock_id", "stock_name", "industry_category", "market"])
+        return pd.DataFrame(rows).drop_duplicates(subset=["stock_id"]).reset_index(drop=True)
+
+    try:
+        df = finmind_get_data(token, dataset="TaiwanStockInfo", timeout=60, max_retries=3, backoff=1.0)
+    except Exception:
+        df = pd.DataFrame()
+
+    df = _ensure_schema(df)
+
+    if df.empty:
+        fb = _fallback_from_local()
+        fb = _ensure_schema(fb)
+        if not fb.empty:
+            try:
+                st.session_state.setdefault("_api_errors", []).append(f"{_now_taipei_str()} TaiwanStockInfo fallback_to_local")
+            except Exception:
+                pass
+            return fb
+
+    return df
 @st.cache_data(ttl=10)
 def get_snapshot_all_cached(token: str) -> pd.DataFrame:
     return finmind_tick_snapshot(token, data_id="", timeout=15)
@@ -3738,7 +3853,14 @@ if "result" not in st.session_state:
     st.session_state["result"] = None
 
 with st.spinner("載入股票清單與產業分類..."):
-    stock_info = get_stock_info_cached(token)
+    try:
+        stock_info = get_stock_info_cached(token)
+    except Exception as _e:
+        stock_info = pd.DataFrame()
+if stock_info is None or (isinstance(stock_info, pd.DataFrame) and stock_info.empty):
+    st.error("無法取得 TaiwanStockInfo（FinMind 連線逾時或資料源暫時不可用）。\n\n建議：\n1) 稍後重試或按 Reboot（清除快取）\n2) 確認 Streamlit Secrets 有 FINMIND_TOKEN\n3) 確認 repo/data 內存在 data/market_tse.csv 與 data/market_otc.csv（可做本機 fallback）")
+    st.stop()
+
 
 if st.sidebar.button("一鍵更新（含交易計畫引擎）"):
     with st.spinner("更新中：即時補丁 / 全市場掃描 / 籌碼 / 營收 / 主題雷達 / 交易計畫..."):
