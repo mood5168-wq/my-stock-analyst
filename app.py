@@ -72,6 +72,7 @@ def append_search_log(event_type: str, payload: dict) -> None:
         pass
 
 def download_search_log_button():
+    import csv as _csv
     logs = st.session_state.get("search_logs", [])
     if not logs:
         st.info("目前尚無查詢紀錄。")
@@ -80,7 +81,7 @@ def download_search_log_button():
     keys = sorted({k for r in logs for k in r.keys()})
     import io
     buf = io.StringIO()
-    w = csv.DictWriter(buf, fieldnames=keys)
+    w = _csv.DictWriter(buf, fieldnames=keys)
     w.writeheader()
     for r in logs:
         w.writerow({k: r.get(k, "") for k in keys})
